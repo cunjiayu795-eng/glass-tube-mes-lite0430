@@ -10953,30 +10953,66 @@ def sync_after_delivery_plan_change(conn, delivery_plan_id):
 
     return True, "交付批次、订单明细、订单主表已同步。"
 
+
 def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
     """
     获取某个交付批次可用于出货的 Lot。
 
-    优先级：
-    1. 订单库存 WH-ORDER，trace_key = 订单 trace_key
-    2. 规格化库存 WH-SPEC，spec_id + SPEC_STOCK trace_key
-    3. 兼容旧规格库存：location = WH-SPEC，spec_id 相同
+    出货匹配优先级：
+    1. 订单库存 WH-ORDER：
+       - trace_key = 订单 trace_key
+       - 用于该订单专属库存
+
+    2. 新规格化库存 WH-SPEC：
+       - spec_id 相同
+       - trace_key = SPEC_STOCK + spec_code + special_process + material
+       - 即：产品规格 + 特殊工艺 + 材质
+
+    3. 兼容旧规格库存：
+       - location = WH-SPEC
+       - spec_id 相同
+       - trace_key 为空 / 非 SPEC_STOCK 格式
+       - 仅作为历史兼容，优先级最低
+
+    返回：
+    - lot_df：可用库存 Lot
+    - plan：当前交付批次信息
     """
+
+    # =========================
+    # 1. 读取交付批次 + 订单明细 + 规格信息
+    # =========================
     plan_df = pd.read_sql_query("""
         SELECT
             dp.delivery_plan_id,
             dp.order_item_id,
             COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
             COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
+            COALESCE(dp.delivery_status, '未排产') AS delivery_status,
+
             oi.trace_key AS order_trace_key,
             oi.product_id,
             oi.spec_id,
             oi.product_spec_text,
             COALESCE(oi.special_process, 'STANDARD') AS special_process,
-            COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material
+            COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.shipped_qty, 0) AS shipped_qty,
+            oi.po_no,
+            oi.customer_pn,
+
+            ps.spec_code,
+            ps.spec_desc,
+            p.product_name,
+            p.product_code
+
         FROM delivery_plan dp
         JOIN order_item oi
             ON dp.order_item_id = oi.order_item_id
+        LEFT JOIN product_spec ps
+            ON oi.spec_id = ps.spec_id
+        LEFT JOIN product p
+            ON oi.product_id = p.product_id
         WHERE dp.delivery_plan_id = ?
     """, conn, params=[int(delivery_plan_id)])
 
@@ -10985,12 +11021,57 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
 
     plan = plan_df.iloc[0]
 
-    spec_stock_trace_key = build_spec_stock_trace_key(
-        product_spec_text=plan["product_spec_text"],
-        special_process=plan["special_process"],
-        material=plan["material"]
-    )
+    spec_id = int(plan["spec_id"]) if pd.notna(plan["spec_id"]) else None
+    product_id = int(plan["product_id"]) if pd.notna(plan["product_id"]) else None
 
+    special_process = normalize_text(plan["special_process"]).upper() or "STANDARD"
+    material = normalize_text(plan["material"]).upper() or "UNKNOWN_MATERIAL"
+
+    # 优先使用产品规格主数据 spec_code；没有则回退到订单里的 product_spec_text
+    spec_code = normalize_text(plan["spec_code"])
+    if not spec_code:
+        spec_code = normalize_text(plan["product_spec_text"])
+
+    # =========================
+    # 2. 生成规格化库存 Key
+    # =========================
+    # 兼容你之前新增的函数名称
+    if "get_spec_stock_key_for_inventory" in globals():
+        spec_stock_trace_key = get_spec_stock_key_for_inventory(
+            spec_code=spec_code,
+            special_process=special_process,
+            material=material
+        )
+    elif "build_spec_stock_group_key" in globals():
+        spec_stock_trace_key = build_spec_stock_group_key(
+            spec_code=spec_code,
+            special_process=special_process,
+            material=material
+        )
+    elif "build_spec_stock_trace_key" in globals():
+        spec_stock_trace_key = build_spec_stock_trace_key(
+            product_spec_text=spec_code,
+            special_process=special_process,
+            material=material
+        )
+    else:
+        spec_stock_trace_key = "__".join([
+            "SPEC_STOCK",
+            normalize_trace_part(spec_code, "NOSPEC"),
+            normalize_trace_part(special_process, "STANDARD"),
+            normalize_trace_part(material, "UNKNOWN_MATERIAL"),
+        ])
+
+    order_trace_key = normalize_text(plan["order_trace_key"])
+
+    # =========================
+    # 3. 读取可出货 Lot
+    # =========================
+    # 说明：
+    # - WH-ORDER 必须订单 trace_key 精确匹配
+    # - WH-SPEC 新逻辑必须 SPEC_STOCK key 精确匹配
+    # - 旧 WH-SPEC 仅作为历史兼容，且排在最后
+    # =========================
     lot_df = pd.read_sql_query("""
         SELECT
             il.inventory_lot_id,
@@ -11002,8 +11083,25 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
             il.location,
             COALESCE(il.available_qty, 0) AS available_qty,
             COALESCE(il.reserved_qty, 0) AS reserved_qty,
-            il.lot_status,
-            il.release_status,
+            COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
+            COALESCE(il.lot_status, 'available') AS lot_status,
+            COALESCE(il.release_status, 'released') AS release_status,
+            COALESCE(il.exclusive_customer, '') AS exclusive_customer,
+            COALESCE(il.forbidden_customer, '') AS forbidden_customer,
+            il.last_out_qty,
+            il.last_out_time,
+
+            ps.spec_code,
+            ps.spec_desc,
+            p.product_name,
+            p.product_code,
+
+            COALESCE(oi.special_process, pb.special_process, ?) AS lot_special_process,
+            COALESCE(oi.material, pb.material, ?) AS lot_material,
+            pb.batch_code,
+            c.customer_name,
+            oi.po_no,
+
             CASE
                 WHEN il.location = 'WH-ORDER'
                  AND il.trace_key = ?
@@ -11014,6 +11112,7 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
                 THEN 2
 
                 WHEN il.location = 'WH-SPEC'
+                 AND il.spec_id = ?
                  AND (
                     il.trace_key IS NULL
                     OR il.trace_key = ''
@@ -11022,19 +11121,63 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
                 THEN 3
 
                 ELSE 99
-            END AS alloc_priority
+            END AS alloc_priority,
+
+            CASE
+                WHEN il.location = 'WH-ORDER'
+                 AND il.trace_key = ?
+                THEN '订单库存匹配'
+
+                WHEN il.location = 'WH-SPEC'
+                 AND il.trace_key = ?
+                THEN '规格化库存精确匹配'
+
+                WHEN il.location = 'WH-SPEC'
+                 AND il.spec_id = ?
+                 AND (
+                    il.trace_key IS NULL
+                    OR il.trace_key = ''
+                    OR il.trace_key NOT LIKE 'SPEC_STOCK__%'
+                 )
+                THEN '旧规格库存兼容匹配'
+
+                ELSE '不可用'
+            END AS match_type
+
         FROM inventory_lot il
-        WHERE il.spec_id = ?
-          AND COALESCE(il.available_qty, 0) > 0
-          AND lower(COALESCE(il.release_status, 'pending')) = 'released'
-          AND lower(COALESCE(il.lot_status, 'hold')) IN ('available', 'reserved')
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN product p
+            ON il.product_id = p.product_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
+        WHERE COALESCE(il.available_qty, 0) > 0
+          AND COALESCE(il.lot_status, 'available') = 'available'
+          AND COALESCE(il.release_status, 'released') = 'released'
           AND (
-                (il.location = 'WH-ORDER' AND il.trace_key = ?)
-                OR
-                (il.location = 'WH-SPEC' AND il.trace_key = ?)
+                (
+                    il.location = 'WH-ORDER'
+                    AND il.trace_key = ?
+                )
                 OR
                 (
                     il.location = 'WH-SPEC'
+                    AND il.spec_id = ?
+                    AND il.trace_key = ?
+                )
+                OR
+                (
+                    il.location = 'WH-SPEC'
+                    AND il.spec_id = ?
                     AND (
                         il.trace_key IS NULL
                         OR il.trace_key = ''
@@ -11042,17 +11185,83 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
                     )
                 )
           )
-        ORDER BY alloc_priority, il.inventory_lot_id
+        ORDER BY
+            alloc_priority,
+            il.inventory_lot_id
     """, conn, params=[
-        str(plan["order_trace_key"]),
+        special_process,
+        material,
+        order_trace_key,
         spec_stock_trace_key,
-        int(plan["spec_id"]),
-        str(plan["order_trace_key"]),
-        spec_stock_trace_key
+        spec_id,
+        order_trace_key,
+        spec_stock_trace_key,
+        spec_id,
+        order_trace_key,
+        spec_id,
+        spec_stock_trace_key,
+        spec_id
     ])
 
-    return lot_df, plan
+    if lot_df.empty:
+        return lot_df, plan
 
+    # =========================
+    # 4. 补充业务显示字段
+    # =========================
+    lot_df = lot_df.copy()
+
+    lot_df["requested_spec_stock_key"] = spec_stock_trace_key
+    lot_df["requested_special_process"] = special_process
+    lot_df["requested_material"] = material
+    lot_df["requested_spec_code"] = spec_code
+
+    lot_df["stock_type"] = lot_df["location"].apply(
+        lambda x: "订单库存" if x == "WH-ORDER" else "规格化库存"
+    )
+
+    lot_df["variant_label"] = (
+        lot_df["requested_special_process"].astype(str)
+        + " / "
+        + lot_df["requested_material"].astype(str)
+    )
+
+    # =========================
+    # 5. 安全校验：
+    # 如果是 WH-SPEC 精确库存，必须 key 完全一致；
+    # 旧库存兼容只允许没有 SPEC_STOCK key 的历史库存。
+    # =========================
+    valid_df = lot_df[
+        (
+            (lot_df["location"] == "WH-ORDER")
+            &
+            (lot_df["trace_key"] == order_trace_key)
+        )
+        |
+        (
+            (lot_df["location"] == "WH-SPEC")
+            &
+            (lot_df["trace_key"] == spec_stock_trace_key)
+        )
+        |
+        (
+            (lot_df["location"] == "WH-SPEC")
+            &
+            (
+                lot_df["trace_key"].isna()
+                |
+                (lot_df["trace_key"].astype(str) == "")
+                |
+                (~lot_df["trace_key"].astype(str).str.startswith("SPEC_STOCK__"))
+            )
+        )
+    ].copy()
+
+    valid_df = valid_df.sort_values(
+        by=["alloc_priority", "inventory_lot_id"]
+    ).reset_index(drop=True)
+
+    return valid_df, plan
 
 def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
                                carrier="SF Express",
@@ -11061,19 +11270,45 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
     """
     按交付批次正式出货。
 
-    支持：
-    - 订单库存 WH-ORDER
-    - 规格化库存 WH-SPEC
-    - 多 Lot 自动拆分扣减
-    - 出货后自动同步订单、交付批次、库存流水
+    出货库存来源：
+    1. 订单库存 WH-ORDER：
+       - trace_key = 订单 trace_key
+       - 优先扣减
+
+    2. 规格化库存 WH-SPEC：
+       - 产品规格 + 特殊工艺 + 材质
+       - 即 SPEC_STOCK__SPEC__PROCESS__MATERIAL
+       - 在订单库存不足时补充
+
+    3. 旧规格库存兼容：
+       - 仅作为最后兜底
+
+    出货后同步：
+    - inventory_lot.available_qty 扣减
+    - inventory_lot.last_out_qty / last_out_time 更新
+    - inventory_transaction_log 写 OUT 流水
+    - shipment 新增出货主表
+    - shipment_item 新增出货明细
+    - delivery_plan.actual_delivery_qty 增加
+    - delivery_plan.actual_delivery_date 更新
+    - delivery_plan.delivery_status 更新
+    - order_item.shipped_qty 增加
+    - 调用 sync_after_delivery_plan_change()
     """
+
     cursor = conn.cursor()
 
-    ship_qty = float(ship_qty)
+    try:
+        ship_qty = float(ship_qty or 0)
+    except Exception:
+        return False, "出货数量格式错误。"
 
     if ship_qty <= 0:
         return False, "出货数量必须大于 0。"
 
+    # =========================
+    # 1. 读取交付批次信息
+    # =========================
     plan_df = pd.read_sql_query("""
         SELECT
             dp.delivery_plan_id,
@@ -11088,6 +11323,7 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
             oi.product_id,
             oi.spec_id,
             oi.po_no,
+            oi.customer_pn,
             COALESCE(oi.ordered_qty, 0) AS ordered_qty,
             COALESCE(oi.shipped_qty, 0) AS shipped_qty,
             oi.product_spec_text,
@@ -11096,6 +11332,7 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
 
             o.customer_id,
             c.customer_name
+
         FROM delivery_plan dp
         JOIN order_item oi
             ON dp.order_item_id = oi.order_item_id
@@ -11111,6 +11348,10 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
 
     plan = plan_df.iloc[0]
 
+    delivery_plan_id = int(plan["delivery_plan_id"])
+    order_item_id = int(plan["order_item_id"])
+    order_id = int(plan["order_id"])
+
     planned_qty = float(plan["planned_delivery_qty"] or 0)
     actual_delivery_qty = float(plan["actual_delivery_qty"] or 0)
     remaining_delivery_qty = max(planned_qty - actual_delivery_qty, 0)
@@ -11119,163 +11360,351 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
         return False, "该交付批次已经完成出货，无需重复出货。"
 
     if ship_qty > remaining_delivery_qty:
-        return False, f"出货数量不能超过该交付批次剩余数量。剩余数量：{remaining_delivery_qty:.0f}。"
+        return False, (
+            f"出货数量不能超过该交付批次剩余数量。"
+            f"剩余数量：{remaining_delivery_qty:.0f}。"
+        )
 
-    lot_df, _ = get_lots_for_delivery_plan_shipment(conn, int(delivery_plan_id))
+    # =========================
+    # 2. 读取可用 Lot
+    # =========================
+    lot_df, _ = get_lots_for_delivery_plan_shipment(
+        conn,
+        int(delivery_plan_id)
+    )
 
-    if lot_df.empty:
+    if lot_df is None or lot_df.empty:
         return False, "没有可用库存。请检查订单库存 WH-ORDER 或规格化库存 WH-SPEC。"
 
-    total_available = pd.to_numeric(
+    lot_df = lot_df.copy()
+    lot_df["available_qty"] = pd.to_numeric(
         lot_df["available_qty"],
         errors="coerce"
-    ).fillna(0).sum()
+    ).fillna(0)
 
-    if total_available < ship_qty:
-        return False, f"可用库存不足。需要 {ship_qty:.0f}，当前可用 {total_available:.0f}。"
+    total_available_qty = float(lot_df["available_qty"].sum())
 
-    shipment_no = f"SHIP-DP{int(delivery_plan_id):04d}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    if total_available_qty < ship_qty:
+        return False, (
+            f"可用库存不足。当前可用 {total_available_qty:.0f}，"
+            f"本次需要出货 {ship_qty:.0f}。"
+        )
 
-    cursor.execute("""
-        INSERT INTO shipment (
-            shipment_no,
-            customer_id,
-            ship_date,
-            carrier,
-            destination,
-            created_by,
-            shipment_status,
-            notes
-        ) VALUES (?,?, date('now'), ?, ?, ?, 'created', ?)
-    """, (
-        shipment_no,
-        int(plan["customer_id"]),
-        carrier,
-        destination,
-        created_by,
-        f"Auto shipment for delivery_plan_id={int(delivery_plan_id)}"
-    ))
+    # =========================
+    # 3. 生成出货主表
+    # =========================
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ship_date = datetime.now().strftime("%Y-%m-%d")
+    shipment_no = (
+        f"SHP-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        f"-DP{delivery_plan_id}"
+    )
+
+    shipment_cols = pd.read_sql_query(
+        "PRAGMA table_info(shipment)",
+        conn
+    )["name"].tolist()
+
+    shipment_data = {
+        "shipment_no": shipment_no,
+        "ship_date": ship_date,
+        "carrier": normalize_text(carrier) or "SF Express",
+        "destination": normalize_text(destination) or "Customer Warehouse",
+        "created_by": normalize_text(created_by) or "Shipment User",
+        "shipment_status": "completed",
+        "notes": (
+            f"按交付批次 {delivery_plan_id} 出货；"
+            f"PO={plan['po_no']}；"
+            f"客户={plan['customer_name']}"
+        ),
+    }
+
+    shipment_insert_cols = [
+        c for c in shipment_data.keys()
+        if c in shipment_cols
+    ]
+
+    shipment_placeholders = ", ".join(["?"] * len(shipment_insert_cols))
+    shipment_col_sql = ", ".join(shipment_insert_cols)
+
+    cursor.execute(
+        f"""
+        INSERT INTO shipment ({shipment_col_sql})
+        VALUES ({shipment_placeholders})
+        """,
+        [shipment_data[c] for c in shipment_insert_cols]
+    )
 
     shipment_id = cursor.lastrowid
 
-    qty_to_allocate = ship_qty
+    # =========================
+    # 4. 多 Lot 自动拆分扣减
+    # =========================
+    remaining_to_ship = float(ship_qty)
     allocated_rows = []
 
+    shipment_item_cols = pd.read_sql_query(
+        "PRAGMA table_info(shipment_item)",
+        conn
+    )["name"].tolist()
+
+    txn_cols = pd.read_sql_query(
+        "PRAGMA table_info(inventory_transaction_log)",
+        conn
+    )["name"].tolist()
+
+    inventory_lot_cols = pd.read_sql_query(
+        "PRAGMA table_info(inventory_lot)",
+        conn
+    )["name"].tolist()
+
     for _, lot in lot_df.iterrows():
-        if qty_to_allocate <= 0:
+        if remaining_to_ship <= 0:
             break
 
-        lot_id = int(lot["inventory_lot_id"])
-        available_qty = float(lot["available_qty"] or 0)
+        inventory_lot_id = int(lot["inventory_lot_id"])
+        lot_code = str(lot["lot_code"])
+        lot_available_qty = float(lot["available_qty"] or 0)
 
-        if available_qty <= 0:
+        if lot_available_qty <= 0:
             continue
 
-        take_qty = min(available_qty, qty_to_allocate)
+        deduct_qty = min(lot_available_qty, remaining_to_ship)
+        new_available_qty = lot_available_qty - deduct_qty
 
-        packaging_code = f"PKG-{shipment_no}-LOT{lot_id}"
+        # =========================
+        # 4.1 更新库存 Lot
+        # =========================
+        update_set_parts = [
+            "available_qty = ?",
+            "last_out_qty = ?",
+            "last_out_time = ?"
+        ]
+        update_values = [
+            float(new_available_qty),
+            float(deduct_qty),
+            now_text
+        ]
 
-        cursor.execute("""
-            INSERT INTO shipment_item (
-                shipment_id,
-                order_item_id,
-                inventory_lot_id,
-                shipped_qty,
-                packaging_label_code,
-                trace_key
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            int(shipment_id),
-            int(plan["order_item_id"]),
-            int(lot_id),
-            float(take_qty),
-            packaging_code,
-            str(plan["order_trace_key"])
-        ))
+        if "lot_status" in inventory_lot_cols:
+            update_set_parts.append("""
+                lot_status = CASE
+                    WHEN ? <= 0 THEN 'depleted'
+                    ELSE lot_status
+                END
+            """)
+            update_values.append(float(new_available_qty))
 
-        cursor.execute("""
+        update_values.append(inventory_lot_id)
+
+        cursor.execute(
+            f"""
             UPDATE inventory_lot
-            SET available_qty = COALESCE(available_qty, 0) - ?,
-                last_out_qty = ?,
-                last_out_time = datetime('now')
+            SET {", ".join(update_set_parts)}
             WHERE inventory_lot_id = ?
-        """, (
-            float(take_qty),
-            float(take_qty),
-            int(lot_id)
-        ))
+            """,
+            update_values
+        )
 
-        cursor.execute("""
-            INSERT INTO inventory_transaction_log (
-                inventory_lot_id,
-                txn_type,
-                qty,
-                txn_time,
-                txn_reason,
-                reference_no
-            ) VALUES (?, 'outbound', ?, datetime('now'), ?, ?)
-        """, (
-            int(lot_id),
-            float(take_qty),
-            f"shipment_delivery_plan_{int(delivery_plan_id)}",
-            shipment_no
-        ))
+        # =========================
+        # 4.2 写 shipment_item
+        # =========================
+        packaging_label_code = (
+            f"PKG-{shipment_no}-LOT{inventory_lot_id}"
+        )
+
+        shipment_item_data = {
+            "shipment_id": int(shipment_id),
+            "order_item_id": int(order_item_id),
+            "inventory_lot_id": int(inventory_lot_id),
+            "shipped_qty": float(deduct_qty),
+            "packaging_label_code": packaging_label_code,
+            "trace_key": str(plan["order_trace_key"]),
+        }
+
+        shipment_item_insert_cols = [
+            c for c in shipment_item_data.keys()
+            if c in shipment_item_cols
+        ]
+
+        shipment_item_placeholders = ", ".join(
+            ["?"] * len(shipment_item_insert_cols)
+        )
+        shipment_item_col_sql = ", ".join(shipment_item_insert_cols)
+
+        cursor.execute(
+            f"""
+            INSERT INTO shipment_item ({shipment_item_col_sql})
+            VALUES ({shipment_item_placeholders})
+            """,
+            [shipment_item_data[c] for c in shipment_item_insert_cols]
+        )
+
+        # =========================
+        # 4.3 写库存 OUT 流水
+        # =========================
+        txn_data = {
+            "inventory_lot_id": int(inventory_lot_id),
+            "txn_type": "OUT",
+            "qty": float(deduct_qty),
+            "txn_time": now_text,
+            "txn_reason": (
+                f"正式出货；出货单={shipment_no}；"
+                f"交付批次={delivery_plan_id}；"
+                f"PO={plan['po_no']}；"
+                f"库存匹配={lot.get('match_type', '')}"
+            ),
+            "reference_no": shipment_no,
+        }
+
+        txn_insert_cols = [
+            c for c in txn_data.keys()
+            if c in txn_cols
+        ]
+
+        txn_placeholders = ", ".join(["?"] * len(txn_insert_cols))
+        txn_col_sql = ", ".join(txn_insert_cols)
+
+        cursor.execute(
+            f"""
+            INSERT INTO inventory_transaction_log ({txn_col_sql})
+            VALUES ({txn_placeholders})
+            """,
+            [txn_data[c] for c in txn_insert_cols]
+        )
 
         allocated_rows.append({
-            "lot_code": lot["lot_code"],
-            "location": lot["location"],
-            "qty": take_qty
+            "inventory_lot_id": inventory_lot_id,
+            "lot_code": lot_code,
+            "location": lot.get("location", ""),
+            "match_type": lot.get("match_type", ""),
+            "deduct_qty": float(deduct_qty),
+            "before_qty": float(lot_available_qty),
+            "after_qty": float(new_available_qty),
         })
 
-        qty_to_allocate -= take_qty
+        remaining_to_ship -= deduct_qty
 
+    # =========================
+    # 5. 安全校验
+    # =========================
+    shipped_total = sum(x["deduct_qty"] for x in allocated_rows)
+
+    if abs(shipped_total - ship_qty) > 0.000001:
+        conn.rollback()
+        return False, (
+            f"库存扣减数量异常。计划出货 {ship_qty:.0f}，"
+            f"实际分配 {shipped_total:.0f}。已回滚。"
+        )
+
+    new_actual_delivery_qty = actual_delivery_qty + ship_qty
+
+    if new_actual_delivery_qty >= planned_qty:
+        new_delivery_status = "已出货"
+    elif new_actual_delivery_qty > 0:
+        new_delivery_status = "部分出货"
+    else:
+        new_delivery_status = str(plan["delivery_status"])
+
+    # =========================
+    # 6. 更新 delivery_plan
+    # =========================
+    cursor.execute("""
+        UPDATE delivery_plan
+        SET actual_delivery_qty = COALESCE(actual_delivery_qty, 0) + ?,
+            actual_delivery_date = ?,
+            delivery_status = ?
+        WHERE delivery_plan_id = ?
+    """, (
+        float(ship_qty),
+        ship_date,
+        new_delivery_status,
+        int(delivery_plan_id)
+    ))
+
+    # =========================
+    # 7. 更新 order_item shipped_qty
+    # =========================
     cursor.execute("""
         UPDATE order_item
         SET shipped_qty = COALESCE(shipped_qty, 0) + ?
         WHERE order_item_id = ?
     """, (
         float(ship_qty),
-        int(plan["order_item_id"])
+        int(order_item_id)
     ))
 
+    # =========================
+    # 8. 初步更新订单状态
+    # 后续再由 sync_after_delivery_plan_change 统一修正
+    # =========================
     cursor.execute("""
-        UPDATE delivery_plan
-        SET actual_delivery_qty = COALESCE(actual_delivery_qty, 0) + ?,
-            actual_delivery_date = date('now')
-        WHERE delivery_plan_id = ?
+        UPDATE orders
+        SET order_status = CASE
+            WHEN (
+                SELECT COALESCE(SUM(shipped_qty), 0)
+                FROM order_item
+                WHERE order_id = ?
+            ) >= (
+                SELECT COALESCE(SUM(ordered_qty), 0)
+                FROM order_item
+                WHERE order_id = ?
+            )
+            THEN 'completed'
+            ELSE order_status
+        END
+        WHERE order_id = ?
     """, (
-        float(ship_qty),
-        int(delivery_plan_id)
+        int(order_id),
+        int(order_id),
+        int(order_id)
     ))
 
     conn.commit()
 
-    # 统一同步交付批次、订单明细、订单主表，并在全部出货后关闭销售指令
-    sync_after_delivery_plan_change(conn, int(delivery_plan_id))
+    # =========================
+    # 9. 统一同步
+    # =========================
+    if "sync_after_delivery_plan_change" in globals():
+        sync_after_delivery_plan_change(
+            conn,
+            int(delivery_plan_id)
+        )
 
-    used_text = "；".join([
-        f"{x['lot_code']}({x['location']}): {x['qty']:.0f}"
+    # =========================
+    # 10. 返回出货结果
+    # =========================
+    allocated_summary = "；".join([
+        (
+            f"{x['lot_code']} "
+            f"({x['location']} / {x['match_type']}) "
+            f"扣减 {x['deduct_qty']:.0f}"
+        )
         for x in allocated_rows
     ])
 
     return True, (
-        f"出货完成：{shipment_no}。"
-        f"出货数量 {ship_qty:.0f}。"
-        f"使用库存：{used_text}"
+        f"出货完成。出货单：{shipment_no}。"
+        f"本次出货 {ship_qty:.0f}。"
+        f"交付批次累计出货 {new_actual_delivery_qty:.0f} / {planned_qty:.0f}。"
+        f"库存扣减：{allocated_summary}"
     )
 
-def page_shipment(conn):
-    st.header("出货追踪｜出货管理")
+
+def page_shipment_management(conn):
+    st.header("出货管理｜按交付批次出货")
 
     st.info(
-        "出货规则：优先使用订单库存 WH-ORDER；不足时可使用规格化库存 WH-SPEC。"
-        "正式出货前必须完成发货确认。出货后会自动同步：库存、库存流水、交付批次状态、订单明细状态、订单主表状态。"
+        "本页面用于按交付批次执行正式出货。"
+        "系统会优先使用订单库存 WH-ORDER；如果订单库存不足，"
+        "再匹配同【产品规格 + 特殊工艺 + 材质】的规格化库存 WH-SPEC。"
+        "出货后会同步库存、库存流水、出货单、交付批次、订单明细和订单状态。"
     )
 
     # =========================
-    # 1. 待出货交付批次
+    # 1. 读取待出货交付批次
     # =========================
-    dp_df = pd.read_sql_query("""
+    delivery_df = pd.read_sql_query("""
         SELECT
             dp.delivery_plan_id,
             dp.order_item_id,
@@ -11283,23 +11712,26 @@ def page_shipment(conn):
             dp.planned_delivery_date,
             COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
             COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
-            COALESCE(dp.planned_delivery_qty, 0) - COALESCE(dp.actual_delivery_qty, 0) AS remaining_delivery_qty,
             COALESCE(dp.delivery_status, '未排产') AS delivery_status,
 
-            c.customer_name,
+            oi.order_id,
             oi.po_no,
             oi.customer_pn,
-            oi.product_type_text,
             oi.product_spec_text,
+            oi.trace_key,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.shipped_qty, 0) AS shipped_qty,
             COALESCE(oi.special_process, 'STANDARD') AS special_process,
             COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
-            oi.trace_key,
 
-            ps.production_batch_id,
-            pb.batch_code,
-            pb.production_flow_status,
-            pm.quality_status,
-            pm.release_status
+            ps.spec_code,
+            ps.spec_desc,
+            p.product_name,
+            p.product_code,
+
+            c.customer_name,
+            o.order_status
+
         FROM delivery_plan dp
         JOIN order_item oi
             ON dp.order_item_id = oi.order_item_id
@@ -11307,254 +11739,369 @@ def page_shipment(conn):
             ON oi.order_id = o.order_id
         JOIN customer c
             ON o.customer_id = c.customer_id
-        LEFT JOIN production_schedule ps
-            ON dp.delivery_plan_id = ps.delivery_plan_id
-        LEFT JOIN production_batch pb
-            ON ps.production_batch_id = pb.production_batch_id
-        LEFT JOIN production_measurement pm
-            ON pb.production_batch_id = pm.production_batch_id
-        WHERE COALESCE(dp.planned_delivery_qty, 0) > COALESCE(dp.actual_delivery_qty, 0)
-          AND COALESCE(dp.delivery_status, '未排产') IN (
-                '发货准备',
-                '已入库',
-                '部分出货'
-          )
-        ORDER BY dp.planned_delivery_date, dp.delivery_plan_id
+        LEFT JOIN product_spec ps
+            ON oi.spec_id = ps.spec_id
+        LEFT JOIN product p
+            ON oi.product_id = p.product_id
+
+        WHERE COALESCE(dp.delivery_status, '') IN (
+            '已入库',
+            '部分出货',
+            '待出货',
+            '待发货',
+            'shipment preparation',
+            '出货准备'
+        )
+        OR (
+            COALESCE(dp.actual_delivery_qty, 0) < COALESCE(dp.planned_delivery_qty, 0)
+            AND COALESCE(dp.delivery_status, '') NOT IN (
+                '未排产',
+                '已排产',
+                '生产中',
+                '质检中',
+                '待入库确认',
+                '已出货',
+                'cancelled',
+                '已取消'
+            )
+        )
+
+        ORDER BY
+            CASE COALESCE(dp.delivery_status, '')
+                WHEN '已入库' THEN 1
+                WHEN '部分出货' THEN 2
+                WHEN '待出货' THEN 3
+                WHEN '待发货' THEN 4
+                ELSE 99
+            END,
+            dp.planned_delivery_date,
+            dp.delivery_plan_id
     """, conn)
 
-    if dp_df.empty:
-        st.info("当前没有可出货的交付批次。")
-    else:
-        st.subheader("可出货交付批次")
+    if delivery_df.empty:
+        st.success("当前没有可出货的交付批次。")
+        return
 
-        show_df(dp_df.rename(columns={
-            "delivery_plan_id": "交付计划编号",
-            "order_item_id": "订单明细编号",
-            "delivery_batch_no": "交付批次",
-            "planned_delivery_date": "计划交付日期",
-            "planned_delivery_qty": "计划交付数量",
-            "actual_delivery_qty": "已出货数量",
-            "remaining_delivery_qty": "剩余待出货",
-            "delivery_status": "交付状态",
-            "customer_name": "客户",
-            "po_no": "PO",
-            "customer_pn": "客户料号",
-            "product_type_text": "产品",
-            "product_spec_text": "规格",
-            "special_process": "特殊工艺",
-            "material": "材质",
-            "batch_code": "生产批号",
-            "quality_status": "质量等级",
-            "release_status": "放行状态"
-        }), hide_index=True)
+    delivery_df = delivery_df.copy()
+    delivery_df["remaining_qty"] = (
+        pd.to_numeric(delivery_df["planned_delivery_qty"], errors="coerce").fillna(0)
+        -
+        pd.to_numeric(delivery_df["actual_delivery_qty"], errors="coerce").fillna(0)
+    ).clip(lower=0)
 
-        st.markdown("---")
+    delivery_df = delivery_df[delivery_df["remaining_qty"] > 0].copy()
 
-        # =========================
-        # 2. 选择交付批次
-        # =========================
-        selected_delivery_plan_id = st.selectbox(
-            "选择要出货的交付批次",
-            dp_df["delivery_plan_id"].tolist(),
-            format_func=lambda x: (
-                f"交付计划 {x} | "
-                f"PO {dp_df.loc[dp_df['delivery_plan_id'] == x, 'po_no'].iloc[0]} | "
-                f"第 {int(dp_df.loc[dp_df['delivery_plan_id'] == x, 'delivery_batch_no'].iloc[0])} 批 | "
-                f"剩余 {float(dp_df.loc[dp_df['delivery_plan_id'] == x, 'remaining_delivery_qty'].iloc[0]):.0f}"
-            ),
-            key="shipment_delivery_plan_select"
-        )
+    if delivery_df.empty:
+        st.success("当前所有交付批次都已完成出货。")
+        return
 
-        selected = dp_df[
-            dp_df["delivery_plan_id"] == selected_delivery_plan_id
-        ].iloc[0]
+    # =========================
+    # 2. 顶部总览
+    # =========================
+    total_remaining_qty = float(delivery_df["remaining_qty"].sum())
+    total_planned_qty = float(pd.to_numeric(
+        delivery_df["planned_delivery_qty"],
+        errors="coerce"
+    ).fillna(0).sum())
+    total_actual_qty = float(pd.to_numeric(
+        delivery_df["actual_delivery_qty"],
+        errors="coerce"
+    ).fillna(0).sum())
 
-        lot_df, _ = get_lots_for_delivery_plan_shipment(
-            conn,
-            int(selected_delivery_plan_id)
-        )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("待出货交付批次数", int(delivery_df["delivery_plan_id"].nunique()))
+    m2.metric("计划交付总量", f"{total_planned_qty:.0f}")
+    m3.metric("已出货总量", f"{total_actual_qty:.0f}")
+    m4.metric("剩余待出货", f"{total_remaining_qty:.0f}")
 
-        available_qty = 0.0
-        if not lot_df.empty:
-            available_qty = pd.to_numeric(
-                lot_df["available_qty"],
-                errors="coerce"
-            ).fillna(0).sum()
+    st.markdown("---")
 
-        remaining_qty = float(selected["remaining_delivery_qty"] or 0)
+    st.subheader("可出货交付批次")
 
-        # =========================
-        # 3. 出货信息确认卡
-        # =========================
-        st.subheader("出货信息确认")
+    show_cols = [
+        "delivery_status",
+        "delivery_plan_id",
+        "delivery_batch_no",
+        "planned_delivery_date",
+        "customer_name",
+        "po_no",
+        "product_name",
+        "spec_code",
+        "product_spec_text",
+        "special_process",
+        "material",
+        "planned_delivery_qty",
+        "actual_delivery_qty",
+        "remaining_qty",
+        "order_status",
+        "trace_key"
+    ]
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("客户", str(selected["customer_name"]))
-        c2.metric("PO", str(selected["po_no"]))
-        c3.metric("交付批次", f"第 {int(selected['delivery_batch_no'])} 批")
-        c4.metric("交付状态", str(selected["delivery_status"]))
+    existing_show_cols = [c for c in show_cols if c in delivery_df.columns]
 
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("计划数量", f"{float(selected['planned_delivery_qty'] or 0):.0f}")
-        c6.metric("已出货", f"{float(selected['actual_delivery_qty'] or 0):.0f}")
-        c7.metric("剩余待出货", f"{remaining_qty:.0f}")
-        c8.metric("可用库存", f"{available_qty:.0f}")
-
-        st.caption(
-            f"产品：{selected['product_type_text']} ｜ "
-            f"规格：{selected['product_spec_text']} ｜ "
-            f"特殊工艺：{selected['special_process']} ｜ "
-            f"材质：{selected['material']} ｜ "
-            f"生产批号：{selected['batch_code'] if pd.notna(selected['batch_code']) else '-'}"
-        )
-
-        st.markdown("Trace Key")
-        st.code(str(selected["trace_key"]))
-
-        # =========================
-        # 4. 出货前检查
-        # =========================
-        st.markdown("---")
-        st.subheader("出货前检查")
-
-        check_pass = True
-
-        if remaining_qty <= 0:
-            st.error("该交付批次已无剩余待出货数量。")
-            check_pass = False
-
-        if available_qty <= 0:
-            st.error("当前没有可用库存，不能出货。")
-            check_pass = False
-
-        if available_qty < remaining_qty:
-            st.warning(
-                f"当前可用库存 {available_qty:.0f} 小于剩余待出货数量 {remaining_qty:.0f}，"
-                "只能部分出货或先补充库存。"
-            )
-        else:
-            st.success("库存数量满足当前交付批次的剩余出货需求。")
-
-        if str(selected["delivery_status"]) not in ["发货准备", "已入库", "部分出货"]:
-            st.error("当前交付状态不允许出货。")
-            check_pass = False
-
-        # =========================
-        # 5. 可用 Lot 分配顺序
-        # =========================
-        st.markdown("---")
-        st.subheader("可用 Lot 分配顺序")
-
-        if lot_df.empty:
-            st.error("当前没有可用 Lot。")
-        else:
-            show_df(lot_df.rename(columns={
-                "inventory_lot_id": "Lot编号",
-                "lot_code": "Lot号",
-                "location": "库存类型",
-                "available_qty": "可用数量",
-                "release_status": "放行状态",
-                "lot_status": "Lot状态",
-                "alloc_priority": "分配优先级"
-            }), hide_index=True)
-
-        # =========================
-        # 6. 发货确认表单
-        # =========================
-        st.markdown("---")
-        st.subheader("发货确认")
-
-        with st.form("delivery_plan_shipment_confirm_form"):
-            ship_qty = st.number_input(
-                "本次出货数量",
-                min_value=1.0,
-                value=float(min(remaining_qty, available_qty)) if min(remaining_qty, available_qty) > 0 else 1.0,
-                step=1.0,
-                key="delivery_plan_ship_qty"
-            )
-
-            carrier = st.text_input(
-                "承运商",
-                value="SF Express",
-                key="delivery_plan_ship_carrier"
-            )
-
-            destination = st.text_input(
-                "目的地",
-                value="Customer Warehouse",
-                key="delivery_plan_ship_destination"
-            )
-
-            created_by = st.text_input(
-                "创建人",
-                value="Warehouse User",
-                key="delivery_plan_ship_created_by"
-            )
-
-            st.markdown("### 最终确认")
-
-            confirm_check = st.checkbox(
-                "我已核对客户、PO、交付批次、规格、数量、库存 Lot，确认可以发货。",
-                key="shipment_confirm_check"
-            )
-
-            confirm_text = st.text_input(
-                "请输入 CONFIRM 进行二次确认",
-                value="",
-                placeholder="输入 CONFIRM 后才能正式出货",
-                key="shipment_confirm_text"
-            )
-
-            submitted = st.form_submit_button("确认发货并同步数据")
-
-        if submitted:
-            if not check_pass:
-                st.error("出货前检查未通过，不能发货。")
-                return
-
-            if not confirm_check:
-                st.error("请先勾选发货确认。")
-                return
-
-            if confirm_text.strip().upper() != "CONFIRM":
-                st.error("请输入 CONFIRM 完成二次确认。")
-                return
-
-            if float(ship_qty) <= 0:
-                st.error("出货数量必须大于 0。")
-                return
-
-            if float(ship_qty) > remaining_qty:
-                st.error(f"出货数量不能超过剩余待出货数量：{remaining_qty:.0f}。")
-                return
-
-            if float(ship_qty) > available_qty:
-                st.error(f"出货数量不能超过当前可用库存：{available_qty:.0f}。")
-                return
-
-            ok, msg = run_delivery_plan_shipment(
-                conn=conn,
-                delivery_plan_id=int(selected_delivery_plan_id),
-                ship_qty=float(ship_qty),
-                carrier=carrier,
-                destination=destination,
-                created_by=created_by
-            )
-
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
+    show_df(delivery_df[existing_show_cols].rename(columns={
+        "delivery_status": "交付状态",
+        "delivery_plan_id": "交付批次编号",
+        "delivery_batch_no": "交付批次",
+        "planned_delivery_date": "计划交付日期",
+        "customer_name": "客户",
+        "po_no": "PO",
+        "product_name": "产品名称",
+        "spec_code": "规格编码",
+        "product_spec_text": "规格文本",
+        "special_process": "特殊工艺",
+        "material": "材质",
+        "planned_delivery_qty": "计划交付数量",
+        "actual_delivery_qty": "已出货数量",
+        "remaining_qty": "剩余待出货",
+        "order_status": "订单状态",
+        "trace_key": "订单 Trace Key"
+    }), hide_index=True)
 
     st.markdown("---")
 
     # =========================
-    # 7. 出货记录
+    # 3. 选择交付批次
     # =========================
-    st.subheader("出货记录")
+    selected_delivery_plan_id = st.selectbox(
+        "选择交付批次进行出货",
+        delivery_df["delivery_plan_id"].tolist(),
+        format_func=lambda x: (
+            f"[{delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'delivery_status'].iloc[0]}] "
+            f"DP {x}｜"
+            f"第 {int(delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'delivery_batch_no'].iloc[0] or 1)} 批｜"
+            f"PO {delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'po_no'].iloc[0]}｜"
+            f"剩余 {float(delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'remaining_qty'].iloc[0] or 0):.0f}｜"
+            f"{delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'special_process'].iloc[0]} / "
+            f"{delivery_df.loc[delivery_df['delivery_plan_id'] == x, 'material'].iloc[0]}"
+        ),
+        key="shipment_delivery_plan_select"
+    )
 
-    shipment_df = pd.read_sql_query("""
+    selected = delivery_df[
+        delivery_df["delivery_plan_id"] == selected_delivery_plan_id
+    ].iloc[0]
+
+    remaining_qty = float(selected["remaining_qty"] or 0)
+    planned_qty = float(selected["planned_delivery_qty"] or 0)
+    actual_qty = float(selected["actual_delivery_qty"] or 0)
+
+    # =========================
+    # 4. 当前交付批次卡片
+    # =========================
+    st.markdown("### 当前交付批次")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("交付批次编号", int(selected["delivery_plan_id"]))
+    c2.metric("客户", str(selected["customer_name"]))
+    c3.metric("PO", str(selected["po_no"]))
+    c4.metric("交付状态", str(selected["delivery_status"]))
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("计划交付数量", f"{planned_qty:.0f}")
+    c6.metric("已出货数量", f"{actual_qty:.0f}")
+    c7.metric("剩余待出货", f"{remaining_qty:.0f}")
+    c8.metric("订单已出货量", f"{float(selected['shipped_qty'] or 0):.0f}")
+
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("规格编码", str(selected["spec_code"]))
+    c10.metric("特殊工艺", str(selected["special_process"]))
+    c11.metric("材质", str(selected["material"]))
+    c12.metric("订单状态", str(selected["order_status"]))
+
+    st.caption(
+        f"产品：{selected['product_name']} ｜ "
+        f"客户料号：{selected['customer_pn']} ｜ "
+        f"规格文本：{selected['product_spec_text']}"
+    )
+
+    st.markdown("订单 Trace Key")
+    st.code(str(selected["trace_key"]))
+
+    # =========================
+    # 5. 查询可用库存 Lot
+    # =========================
+    lot_df, plan = get_lots_for_delivery_plan_shipment(
+        conn,
+        int(selected_delivery_plan_id)
+    )
+
+    st.markdown("---")
+    st.subheader("可用于本次出货的库存 Lot")
+
+    if lot_df is None or lot_df.empty:
+        st.error(
+            "当前没有可用于该交付批次的库存。"
+            "请检查：1）订单库存 WH-ORDER 是否存在；"
+            "2）规格化库存 WH-SPEC 是否有相同产品规格 + 特殊工艺 + 材质；"
+            "3）Lot 是否 released 且 available。"
+        )
+        return
+
+    lot_df = lot_df.copy()
+    lot_df["available_qty"] = pd.to_numeric(
+        lot_df["available_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    total_available_qty = float(lot_df["available_qty"].sum())
+
+    order_available_qty = float(
+        lot_df.loc[
+            lot_df["location"].astype(str) == "WH-ORDER",
+            "available_qty"
+        ].sum()
+    )
+
+    spec_available_qty = float(
+        lot_df.loc[
+            lot_df["location"].astype(str) == "WH-SPEC",
+            "available_qty"
+        ].sum()
+    )
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("总可用库存", f"{total_available_qty:.0f}")
+    a2.metric("订单库存可用", f"{order_available_qty:.0f}")
+    a3.metric("规格化库存可用", f"{spec_available_qty:.0f}")
+    a4.metric(
+        "是否满足本批次",
+        "可以出货" if total_available_qty >= remaining_qty else "库存不足"
+    )
+
+    if total_available_qty < remaining_qty:
+        st.warning(
+            f"当前可用库存 {total_available_qty:.0f} 小于剩余待出货 {remaining_qty:.0f}，"
+            "只能部分出货或先补充库存。"
+        )
+    else:
+        st.success(
+            "当前可用库存可以覆盖本交付批次剩余出货数量。"
+        )
+
+    lot_show_cols = [
+        "match_type",
+        "alloc_priority",
+        "inventory_lot_id",
+        "lot_code",
+        "location",
+        "stock_type",
+        "available_qty",
+        "reserved_qty",
+        "lot_status",
+        "release_status",
+        "spec_code",
+        "requested_spec_code",
+        "requested_special_process",
+        "requested_material",
+        "variant_label",
+        "batch_code",
+        "customer_name",
+        "po_no",
+        "trace_key",
+        "requested_spec_stock_key"
+    ]
+
+    lot_existing_cols = [c for c in lot_show_cols if c in lot_df.columns]
+
+    show_df(lot_df[lot_existing_cols].rename(columns={
+        "match_type": "匹配类型",
+        "alloc_priority": "扣减优先级",
+        "inventory_lot_id": "Lot编号",
+        "lot_code": "Lot号",
+        "location": "库位",
+        "stock_type": "库存类型",
+        "available_qty": "可用数量",
+        "reserved_qty": "预留数量",
+        "lot_status": "Lot状态",
+        "release_status": "放行状态",
+        "spec_code": "Lot规格编码",
+        "requested_spec_code": "需求规格编码",
+        "requested_special_process": "需求特殊工艺",
+        "requested_material": "需求材质",
+        "variant_label": "需求工艺/材质",
+        "batch_code": "来源批次",
+        "customer_name": "来源客户",
+        "po_no": "来源PO",
+        "trace_key": "Lot Trace Key",
+        "requested_spec_stock_key": "需求规格化库存Key"
+    }), hide_index=True)
+
+    # =========================
+    # 6. 出货表单
+    # =========================
+    st.markdown("---")
+    st.subheader("执行出货")
+
+    max_ship_qty = min(remaining_qty, total_available_qty)
+
+    if max_ship_qty <= 0:
+        st.error("当前没有可出货数量。")
+        return
+
+    with st.form(key=f"shipment_form_dp_{int(selected_delivery_plan_id)}"):
+        s1, s2, s3 = st.columns(3)
+
+        with s1:
+            ship_qty = st.number_input(
+                "本次出货数量",
+                min_value=1.0,
+                max_value=float(max_ship_qty),
+                value=float(max_ship_qty),
+                step=1.0,
+                key=f"ship_qty_{int(selected_delivery_plan_id)}"
+            )
+
+        with s2:
+            carrier = st.text_input(
+                "承运商",
+                value="SF Express",
+                key=f"shipment_carrier_{int(selected_delivery_plan_id)}"
+            )
+
+        with s3:
+            created_by = st.text_input(
+                "创建人",
+                value="Shipment User",
+                key=f"shipment_created_by_{int(selected_delivery_plan_id)}"
+            )
+
+        destination = st.text_input(
+            "目的地",
+            value="Customer Warehouse",
+            key=f"shipment_destination_{int(selected_delivery_plan_id)}"
+        )
+
+        st.warning(
+            "确认后系统将自动扣减库存、写入库存 OUT 流水、生成出货单和出货明细，"
+            "并同步交付批次、订单明细和订单状态。"
+        )
+
+        submitted = st.form_submit_button("确认出货")
+
+    if submitted:
+        ok, msg = run_delivery_plan_shipment(
+            conn=conn,
+            delivery_plan_id=int(selected_delivery_plan_id),
+            ship_qty=float(ship_qty),
+            carrier=carrier,
+            destination=destination,
+            created_by=created_by
+        )
+
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    # =========================
+    # 7. 最近出货记录
+    # =========================
+    st.markdown("---")
+    st.subheader("最近出货记录")
+
+    recent_ship_df = pd.read_sql_query("""
         SELECT
             s.shipment_id,
             s.shipment_no,
@@ -11570,49 +12117,41 @@ def page_shipment(conn):
             il.location,
             si.shipped_qty,
             si.packaging_label_code,
-            si.trace_key
+            si.trace_key,
+            s.notes
         FROM shipment s
         LEFT JOIN shipment_item si
             ON s.shipment_id = si.shipment_id
         LEFT JOIN inventory_lot il
             ON si.inventory_lot_id = il.inventory_lot_id
-        ORDER BY s.shipment_id DESC, si.shipment_item_id DESC
+        ORDER BY
+            s.shipment_id DESC,
+            si.shipment_item_id DESC
+        LIMIT 50
     """, conn)
 
-    if shipment_df.empty:
+    if recent_ship_df.empty:
         st.info("当前没有出货记录。")
     else:
-        show_df(shipment_df, hide_index=True)
+        show_df(recent_ship_df.rename(columns={
+            "shipment_id": "出货编号",
+            "shipment_no": "出货单号",
+            "ship_date": "出货日期",
+            "carrier": "承运商",
+            "destination": "目的地",
+            "created_by": "创建人",
+            "shipment_status": "出货状态",
+            "shipment_item_id": "出货明细编号",
+            "order_item_id": "订单明细编号",
+            "inventory_lot_id": "Lot编号",
+            "lot_code": "Lot号",
+            "location": "库位",
+            "shipped_qty": "出货数量",
+            "packaging_label_code": "包装标签号",
+            "trace_key": "Trace Key",
+            "notes": "备注"
+        }), hide_index=True)
 
-    st.markdown("---")
-
-    # =========================
-    # 8. 出货后库存流水
-    # =========================
-    st.subheader("库存出货流水")
-
-    txn_df = pd.read_sql_query("""
-        SELECT
-            itl.txn_id,
-            itl.inventory_lot_id,
-            il.lot_code,
-            il.location,
-            itl.txn_type,
-            itl.qty,
-            itl.txn_time,
-            itl.txn_reason,
-            itl.reference_no
-        FROM inventory_transaction_log itl
-        LEFT JOIN inventory_lot il
-            ON itl.inventory_lot_id = il.inventory_lot_id
-        WHERE itl.txn_type = 'outbound'
-        ORDER BY itl.txn_id DESC
-    """, conn)
-
-    if txn_df.empty:
-        st.info("当前没有出货流水。")
-    else:
-        show_df(txn_df, hide_index=True)
 
 # =========================
 # 覆盖版：质检中 → 质量放行 → 自动入库 → 库存/交付状态同步
@@ -13374,14 +13913,19 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
         else:
             st.error(msg)
 
+
 def page_inventory_overview(conn):
     st.header("仓储｜仓储总看板")
 
     st.info(
-        "仓储总看板现在负责：库存总览、入库确认、订单库存、规格化库存、库存流水。"
-        "入库确认后，库存看板和出货管理会同步看到最新库存。"
+        "仓储总看板用于集中处理：正式入库确认、订单库存、规格化库存、"
+        "规格化库存非买卖调整、库存明细和库存流水。"
+        "规格化库存统一按【产品规格 + 特殊工艺 + 材质】查询。"
     )
 
+    # =========================
+    # 1. 库存总览基础查询
+    # =========================
     stock_df = pd.read_sql_query("""
         SELECT
             il.inventory_lot_id,
@@ -13394,96 +13938,96 @@ def page_inventory_overview(conn):
             COALESCE(il.available_qty, 0) AS available_qty,
             COALESCE(il.reserved_qty, 0) AS reserved_qty,
             COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
-            il.lot_status,
-            il.release_status,
-            il.exclusive_customer,
-            il.forbidden_customer,
+            COALESCE(il.lot_status, '') AS lot_status,
+            COALESCE(il.release_status, '') AS release_status,
+            COALESCE(il.exclusive_customer, '') AS exclusive_customer,
+            COALESCE(il.forbidden_customer, '') AS forbidden_customer,
             il.last_out_qty,
             il.last_out_time,
+
             ps.spec_code,
-            ps.outer_diameter_mm,
-            ps.wall_thickness_mm,
-            ps.length_mm,
+            ps.spec_desc,
             p.product_name,
+            p.product_code,
+
+            COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS special_process,
+            COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS material,
+
+            pb.batch_code,
+            pb.production_flow_status,
+
+            c.customer_name,
+            oi.po_no,
+
             CASE
                 WHEN il.location = 'WH-ORDER' THEN '订单库存'
                 WHEN il.location = 'WH-SPEC' THEN '规格化库存'
                 WHEN il.trace_key LIKE 'SPEC_STOCK%' THEN '规格化库存'
                 ELSE '其他库存'
             END AS stock_type
+
         FROM inventory_lot il
         LEFT JOIN product_spec ps
             ON il.spec_id = ps.spec_id
         LEFT JOIN product p
             ON il.product_id = p.product_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
         ORDER BY
             stock_type,
-            ps.outer_diameter_mm ASC,
-            ps.wall_thickness_mm ASC,
-            ps.length_mm ASC,
-            il.inventory_lot_id ASC
+            ps.spec_code,
+            special_process,
+            material,
+            il.inventory_lot_id
     """, conn)
 
     if stock_df.empty:
-        order_stock_qty = 0
-        spec_stock_qty = 0
-        other_stock_qty = 0
-        total_stock_qty = 0
+        total_stock_qty = 0.0
+        order_stock_qty = 0.0
+        spec_stock_qty = 0.0
+        other_stock_qty = 0.0
     else:
-        order_stock_qty = stock_df.loc[
-            stock_df["stock_type"] == "订单库存",
-            "lot_total_qty"
-        ].sum()
+        order_stock_qty = pd.to_numeric(
+            stock_df.loc[stock_df["stock_type"] == "订单库存", "lot_total_qty"],
+            errors="coerce"
+        ).fillna(0).sum()
 
-        spec_stock_qty = stock_df.loc[
-            stock_df["stock_type"] == "规格化库存",
-            "lot_total_qty"
-        ].sum()
+        spec_stock_qty = pd.to_numeric(
+            stock_df.loc[stock_df["stock_type"] == "规格化库存", "lot_total_qty"],
+            errors="coerce"
+        ).fillna(0).sum()
 
-        other_stock_qty = stock_df.loc[
-            stock_df["stock_type"] == "其他库存",
-            "lot_total_qty"
-        ].sum()
+        other_stock_qty = pd.to_numeric(
+            stock_df.loc[stock_df["stock_type"] == "其他库存", "lot_total_qty"],
+            errors="coerce"
+        ).fillna(0).sum()
 
-        total_stock_qty = order_stock_qty + spec_stock_qty
+        total_stock_qty = order_stock_qty + spec_stock_qty + other_stock_qty
 
-    # 待入库数量
-    wait_inbound_df = pd.read_sql_query("""
-        SELECT
-            COUNT(DISTINCT pb.production_batch_id) AS wait_inbound_batch_count,
-            COALESCE(SUM(COALESCE(pb.actual_qty, 0)), 0) AS wait_inbound_qty
-        FROM production_batch pb
-        JOIN production_schedule ps
-            ON pb.production_batch_id = ps.production_batch_id
-        LEFT JOIN delivery_plan dp
-            ON ps.delivery_plan_id = dp.delivery_plan_id
-        LEFT JOIN production_measurement pm
-            ON pb.production_batch_id = pm.production_batch_id
-        LEFT JOIN inventory_lot il
-            ON pb.production_batch_id = il.production_batch_id
-        WHERE lower(COALESCE(pm.release_status, 'pending')) = 'released'
-          AND (
-                il.inventory_lot_id IS NULL
-                OR COALESCE(dp.delivery_status, '') = '待入库确认'
-              )
-    """, conn)
-
-    wait_inbound_batch_count = int(wait_inbound_df.iloc[0]["wait_inbound_batch_count"] or 0)
-    wait_inbound_qty = float(wait_inbound_df.iloc[0]["wait_inbound_qty"] or 0)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("总库存", f"{total_stock_qty:.0f}")
-    c2.metric("订单库存", f"{order_stock_qty:.0f}")
-    c3.metric("规格化库存", f"{spec_stock_qty:.0f}")
-    c4.metric("待入库批次", f"{wait_inbound_batch_count}")
-    c5.metric("待入库数量", f"{wait_inbound_qty:.0f}")
-
-    st.caption("总库存口径：订单库存 WH-ORDER + 规格化库存 WH-SPEC；其他库存单独列示，不计入主口径。")
+    # =========================
+    # 2. 顶部指标
+    # =========================
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总库存", f"{float(total_stock_qty):.0f}")
+    c2.metric("订单库存 WH-ORDER", f"{float(order_stock_qty):.0f}")
+    c3.metric("规格化库存 WH-SPEC", f"{float(spec_stock_qty):.0f}")
+    c4.metric("其他库存", f"{float(other_stock_qty):.0f}")
 
     st.markdown("---")
 
-    tab_summary, tab_inbound, tab_order, tab_spec, tab_spec_adjust, tab_detail, tab_txn = st.tabs([
-        "库存总览",
+    # =========================
+    # 3. Tabs
+    # =========================
+    tab_inbound, tab_order, tab_spec, tab_spec_adjust, tab_detail, tab_txn = st.tabs([
         "入库确认",
         "订单库存",
         "规格化库存",
@@ -13492,79 +14036,21 @@ def page_inventory_overview(conn):
         "库存流水"
     ])
 
-    with tab_summary:
-        st.subheader("按规格汇总库存")
-
-        spec_summary_df = pd.read_sql_query("""
-            SELECT
-                ps.spec_id,
-                ps.spec_code,
-                p.product_name,
-                ps.outer_diameter_mm,
-                ps.wall_thickness_mm,
-                ps.length_mm,
-
-                COALESCE(SUM(
-                    CASE
-                        WHEN il.location = 'WH-ORDER'
-                        THEN COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0)
-                        ELSE 0
-                    END
-                ), 0) AS order_stock_qty,
-
-                COALESCE(SUM(
-                    CASE
-                        WHEN il.location = 'WH-SPEC'
-                          OR il.trace_key LIKE 'SPEC_STOCK%'
-                        THEN COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0)
-                        ELSE 0
-                    END
-                ), 0) AS spec_stock_qty,
-
-                COALESCE(SUM(
-                    CASE
-                        WHEN il.location IN ('WH-ORDER', 'WH-SPEC')
-                          OR il.trace_key LIKE 'SPEC_STOCK%'
-                        THEN COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0)
-                        ELSE 0
-                    END
-                ), 0) AS total_stock_qty,
-
-                COALESCE(SUM(il.available_qty), 0) AS available_stock_qty,
-                COALESCE(SUM(il.reserved_qty), 0) AS reserved_stock_qty,
-
-                COUNT(DISTINCT il.inventory_lot_id) AS lot_count
-
-            FROM inventory_lot il
-            LEFT JOIN product_spec ps
-                ON il.spec_id = ps.spec_id
-            LEFT JOIN product p
-                ON il.product_id = p.product_id
-            GROUP BY
-                ps.spec_id,
-                ps.spec_code,
-                p.product_name,
-                ps.outer_diameter_mm,
-                ps.wall_thickness_mm,
-                ps.length_mm
-            ORDER BY
-                ps.outer_diameter_mm ASC,
-                ps.wall_thickness_mm ASC,
-                ps.length_mm ASC,
-                ps.spec_code ASC
-        """, conn)
-
-        if spec_summary_df.empty:
-            st.info("当前没有库存汇总数据。")
-        else:
-            show_df(spec_summary_df, hide_index=True)
-
+    # =========================
+    # 3.1 入库确认
+    # =========================
     with tab_inbound:
-        render_inbound_confirm_section(
-            conn,
-            section_key_prefix="warehouse_overview"
-        )
+        if "render_inbound_confirm_section" in globals():
+            render_inbound_confirm_section(
+                conn,
+                section_key_prefix="warehouse_overview"
+            )
+        else:
+            st.warning("未找到 render_inbound_confirm_section()，请先补充入库确认函数。")
 
+    # =========================
+    # 3.2 订单库存
+    # =========================
     with tab_order:
         st.subheader("订单库存 WH-ORDER")
 
@@ -13572,39 +14058,108 @@ def page_inventory_overview(conn):
             st.info("当前没有订单库存。")
         else:
             order_df = stock_df[stock_df["stock_type"] == "订单库存"].copy()
+
             if order_df.empty:
                 st.info("当前没有订单库存。")
             else:
-                show_df(order_df, hide_index=True)
+                show_df(order_df.rename(columns={
+                    "inventory_lot_id": "Lot编号",
+                    "lot_code": "Lot号",
+                    "production_batch_id": "生产批次编号",
+                    "product_id": "产品编号",
+                    "spec_id": "规格编号",
+                    "trace_key": "Trace Key",
+                    "location": "库位",
+                    "available_qty": "可用数量",
+                    "reserved_qty": "预留数量",
+                    "lot_total_qty": "总数量",
+                    "lot_status": "Lot状态",
+                    "release_status": "放行状态",
+                    "exclusive_customer": "专供客户",
+                    "forbidden_customer": "禁用客户",
+                    "last_out_qty": "最近出库数量",
+                    "last_out_time": "最近出库时间",
+                    "spec_code": "规格编码",
+                    "spec_desc": "规格描述",
+                    "product_name": "产品名称",
+                    "product_code": "产品编码",
+                    "special_process": "特殊工艺",
+                    "material": "材质",
+                    "batch_code": "来源生产批号",
+                    "production_flow_status": "生产状态",
+                    "customer_name": "来源客户",
+                    "po_no": "来源PO",
+                    "stock_type": "库存类型"
+                }), hide_index=True)
 
+    # =========================
+    # 3.3 规格化库存
+    # 关键修改：
+    # 只保留新版规格化库存查询区块，不再重复显示旧 spec_df 表
+    # =========================
     with tab_spec:
-        render_spec_stock_query_section(
-            conn,
-            section_key_prefix="warehouse_overview"
-        )
-
-        if stock_df.empty:
-            st.info("当前没有规格化库存。")
+        if "render_spec_stock_query_section" in globals():
+            render_spec_stock_query_section(
+                conn,
+                section_key_prefix="warehouse_overview"
+            )
         else:
-            spec_df = stock_df[stock_df["stock_type"] == "规格化库存"].copy()
-            if spec_df.empty:
-                st.info("当前没有规格化库存。")
-            else:
-                show_df(spec_df, hide_index=True)
-    with tab_spec_adjust:
-         render_spec_inventory_adjust_section(
-            conn,
-            section_key_prefix="warehouse_overview"
-         )
+            st.warning("未找到 render_spec_stock_query_section()，请先补充规格化库存查询函数。")
 
+    # =========================
+    # 3.4 规格化库存调整
+    # =========================
+    with tab_spec_adjust:
+        if "render_spec_inventory_adjust_section" in globals():
+            render_spec_inventory_adjust_section(
+                conn,
+                section_key_prefix="warehouse_overview"
+            )
+        else:
+            st.warning("未找到 render_spec_inventory_adjust_section()，请先补充规格化库存调整函数。")
+
+    # =========================
+    # 3.5 库存明细
+    # =========================
     with tab_detail:
         st.subheader("库存明细")
 
         if stock_df.empty:
             st.info("当前没有库存。")
         else:
-            show_df(stock_df, hide_index=True)
+            show_df(stock_df.rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "production_batch_id": "生产批次编号",
+                "product_id": "产品编号",
+                "spec_id": "规格编号",
+                "trace_key": "Trace Key",
+                "location": "库位",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "lot_total_qty": "总数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "exclusive_customer": "专供客户",
+                "forbidden_customer": "禁用客户",
+                "last_out_qty": "最近出库数量",
+                "last_out_time": "最近出库时间",
+                "spec_code": "规格编码",
+                "spec_desc": "规格描述",
+                "product_name": "产品名称",
+                "product_code": "产品编码",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "batch_code": "来源生产批号",
+                "production_flow_status": "生产状态",
+                "customer_name": "来源客户",
+                "po_no": "来源PO",
+                "stock_type": "库存类型"
+            }), hide_index=True)
 
+    # =========================
+    # 3.6 库存流水
+    # =========================
     with tab_txn:
         st.subheader("库存流水")
 
@@ -13629,8 +14184,18 @@ def page_inventory_overview(conn):
         if txn_df.empty:
             st.info("当前没有库存流水。")
         else:
-            show_df(txn_df, hide_index=True)
-
+            show_df(txn_df.rename(columns={
+                "txn_id": "流水编号",
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "location": "库位",
+                "trace_key": "Trace Key",
+                "txn_type": "交易类型",
+                "qty": "数量",
+                "txn_time": "交易时间",
+                "txn_reason": "交易原因",
+                "reference_no": "参考单号"
+            }), hide_index=True)
 
 # =========================
 # 退货再上架：进入规格化库存 WH-SPEC
