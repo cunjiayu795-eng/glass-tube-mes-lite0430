@@ -12434,18 +12434,21 @@ def update_batch_quality_release(
 
 def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None, confirmed_by="Warehouse User"):
     """
-    仓储总看板：入库确认。
+    仓储总看板：正式入库确认。
 
-    自动分类入库规则：
-    1. 计划交付数量以内 -> 订单库存 WH-ORDER
-    2. 超过计划交付数量 -> 规格化库存 WH-SPEC
-    3. 自动写入 inventory_transaction_log
-    4. production_batch.finished_wh_qty = 入库数量
-    5. production_batch.semi_finished_wh_qty = 0
-    6. production_batch.production_flow_status = 'inbound_done'
-    7. delivery_plan.delivery_status = '已入库'
-    8. 调用 sync_after_delivery_plan_change() 统一同步
+    核心规则：
+    - 入库数量必须等于端检后数量。
+    - 优先读取 End Inspection output_qty。
+    - 其次读取 production_measurement.qc_after_qty。
+    - 不再直接使用旧 actual_qty 作为最终入库数量。
+    - 入库后：
+        production_batch.finished_wh_qty = 入库数量
+        production_batch.semi_finished_wh_qty = 0
+        production_batch.production_flow_status = '已入库'
+        delivery_plan.delivery_status = '已入库'
     """
+
+    ensure_semi_finished_warehouse_schema(conn)
 
     cursor = conn.cursor()
 
@@ -12455,9 +12458,9 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None,
             pb.batch_code,
             pb.trace_key,
             COALESCE(pb.actual_qty, 0) AS actual_qty,
-            COALESCE(pb.required_production_qty, 0) AS required_production_qty,
             COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
             COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
+            COALESCE(pb.required_production_qty, 0) AS required_production_qty,
             COALESCE(pb.special_process, 'STANDARD') AS special_process,
             COALESCE(pb.material, 'UNKNOWN_MATERIAL') AS material,
 
@@ -12465,6 +12468,7 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None,
             ps.delivery_plan_id,
             ps.order_item_id,
 
+            COALESCE(dp.delivery_batch_no, 1) AS delivery_batch_no,
             COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
             COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
             COALESCE(dp.delivery_status, '未排产') AS delivery_status,
@@ -12477,14 +12481,14 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None,
             COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS order_special_process,
             COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS order_material,
 
-            pm.measurement_id,
-            COALESCE(pm.quality_status, 'Pending') AS quality_status,
+            pm.quality_status,
             COALESCE(pm.release_status, 'pending') AS release_status,
             COALESCE(pm.qc_before_qty, 0) AS qc_before_qty,
             COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
             COALESCE(pm.qc_loss_qty, 0) AS qc_loss_qty
+
         FROM production_batch pb
-        LEFT JOIN production_schedule ps
+        JOIN production_schedule ps
             ON pb.production_batch_id = ps.production_batch_id
         LEFT JOIN delivery_plan dp
             ON ps.delivery_plan_id = dp.delivery_plan_id
@@ -12493,8 +12497,6 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None,
         LEFT JOIN production_measurement pm
             ON pb.production_batch_id = pm.production_batch_id
         WHERE pb.production_batch_id = ?
-        ORDER BY pm.measurement_id DESC
-        LIMIT 1
     """, conn, params=[int(production_batch_id)])
 
     if info_df.empty:
@@ -12502,227 +12504,186 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, location=None,
 
     row = info_df.iloc[0]
 
+    batch_id = int(row["production_batch_id"])
     batch_code = str(row["batch_code"])
     delivery_plan_id = row["delivery_plan_id"]
     order_item_id = row["order_item_id"]
 
     release_status = str(row["release_status"] or "pending").lower()
+    delivery_status = str(row["delivery_status"] or "")
 
     if release_status != "released":
-        return False, "当前批次尚未质检放行，不能入库。请先到【半成品仓库看板 → 质检放行】完成放行。"
+        return False, "该批次尚未 released，不能正式入库。"
 
-    # =========================
-    # 防止重复入库
-    # =========================
-    exists_lot_df = pd.read_sql_query("""
+    if delivery_status == "已入库":
+        return False, "该批次已经入库，不能重复入库。"
+
+    # 防止重复生成库存 Lot
+    existed_lot_df = pd.read_sql_query("""
         SELECT COUNT(*) AS cnt
         FROM inventory_lot
         WHERE production_batch_id = ?
-    """, conn, params=[int(production_batch_id)])
+    """, conn, params=[batch_id])
 
-    if int(exists_lot_df.iloc[0]["cnt"] or 0) > 0:
-        return False, "该生产批次已经生成库存 Lot，不能重复入库。"
+    existed_lot_count = int(existed_lot_df.iloc[0]["cnt"] or 0)
 
-    actual_qty = float(row["actual_qty"] or 0)
-    semi_finished_qty = float(row["semi_finished_wh_qty"] or 0)
-    qc_after_qty = float(row["qc_after_qty"] or 0)
+    if existed_lot_count > 0 and delivery_status != "待入库确认":
+        return False, "该批次已经存在库存 Lot，不能重复入库。"
 
-    # 优先使用检测后合格数量，其次使用实际生产数量
-    inbound_qty = qc_after_qty if qc_after_qty > 0 else actual_qty
+    inbound_qty = get_final_inbound_ready_qty(conn, batch_id)
 
     if inbound_qty <= 0:
-        return False, "可入库数量为 0，不能入库。"
+        return False, "待入库数量为 0，不能入库。请检查端检后数量 qc_after_qty。"
+
+    qc_after_qty = float(row["qc_after_qty"] or 0)
+
+    if qc_after_qty > 0 and abs(inbound_qty - qc_after_qty) > 0.000001:
+        return False, (
+            f"入库数量 {inbound_qty:.0f} 与端检后数量 {qc_after_qty:.0f} 不一致，"
+            "请先在半成品仓库执行数量同步。"
+        )
 
     planned_delivery_qty = float(row["planned_delivery_qty"] or 0)
 
-    # 订单库存数量：计划交付数量以内
-    order_linked_inbound_qty = min(inbound_qty, planned_delivery_qty)
-
-    # 规格化库存数量：超出计划交付部分
-    extra_spec_inbound_qty = max(inbound_qty - order_linked_inbound_qty, 0)
+    # 自动分类：计划交付数量以内进入订单库存，超出部分进入规格化库存
+    order_stock_qty = min(float(inbound_qty), float(planned_delivery_qty)) if planned_delivery_qty > 0 else float(inbound_qty)
+    spec_stock_qty = max(float(inbound_qty) - float(order_stock_qty), 0.0)
 
     product_id = int(row["product_id"]) if pd.notna(row["product_id"]) else None
     spec_id = int(row["spec_id"]) if pd.notna(row["spec_id"]) else None
+    trace_key = normalize_text(row["order_trace_key"]) or normalize_text(row["trace_key"])
+    confirmed_by = normalize_text(confirmed_by) or "Warehouse User"
 
-    order_trace_key = str(row["order_trace_key"] or row["trace_key"])
-    product_spec_text = str(row["product_spec_text"] or "")
-    order_special_process = str(row["order_special_process"] or row["special_process"] or "STANDARD")
-    order_material = str(row["order_material"] or row["material"] or "UNKNOWN_MATERIAL")
+    try:
+        created_lot_ids = []
 
-    spec_stock_trace_key = build_spec_stock_trace_key(
-        product_spec_text=product_spec_text,
-        special_process=order_special_process,
-        material=order_material
-    )
+        # =========================
+        # 1. 订单库存 WH-ORDER
+        # =========================
+        if order_stock_qty > 0:
+            order_location = location or "WH-ORDER"
+            order_lot_code = f"LOT-{batch_code}-ORDER"
 
-    # =========================
-    # 1. 订单库存 WH-ORDER
-    # =========================
-    if order_linked_inbound_qty > 0:
-        order_lot_code = f"LOT-ORDER-{batch_code}"
-
-        cursor.execute("""
-            INSERT INTO inventory_lot (
-                production_batch_id,
-                product_id,
-                spec_id,
-                lot_code,
-                trace_key,
-                location,
-                available_qty,
-                reserved_qty,
-                lot_status,
-                release_status,
-                exclusive_customer,
-                forbidden_customer
-            ) VALUES (?, ?, ?, ?, ?, 'WH-ORDER', ?, 0, 'available', 'released', NULL, NULL)
-        """, (
-            int(production_batch_id),
-            product_id,
-            spec_id,
-            order_lot_code,
-            order_trace_key,
-            float(order_linked_inbound_qty)
-        ))
-
-        order_lot_id = cursor.lastrowid
-
-        cursor.execute("""
-            INSERT INTO inventory_transaction_log (
-                inventory_lot_id,
-                txn_type,
-                qty,
-                txn_reason,
-                reference_no
-            ) VALUES (?, 'inbound', ?, ?, ?)
-        """, (
-            int(order_lot_id),
-            float(order_linked_inbound_qty),
-            f"入库确认：订单库存；操作人：{confirmed_by}",
-            batch_code
-        ))
-
-    # =========================
-    # 2. 规格化库存 WH-SPEC
-    # =========================
-    if extra_spec_inbound_qty > 0:
-        spec_lot_code = f"LOT-SPEC-{batch_code}"
-
-        cursor.execute("""
-            INSERT INTO inventory_lot (
-                production_batch_id,
-                product_id,
-                spec_id,
-                lot_code,
-                trace_key,
-                location,
-                available_qty,
-                reserved_qty,
-                lot_status,
-                release_status,
-                exclusive_customer,
-                forbidden_customer
-            ) VALUES (?, ?, ?, ?, ?, 'WH-SPEC', ?, 0, 'available', 'released', NULL, NULL)
-        """, (
-            int(production_batch_id),
-            product_id,
-            spec_id,
-            spec_lot_code,
-            spec_stock_trace_key,
-            float(extra_spec_inbound_qty)
-        ))
-
-        spec_lot_id = cursor.lastrowid
-
-        cursor.execute("""
-            INSERT INTO inventory_transaction_log (
-                inventory_lot_id,
-                txn_type,
-                qty,
-                txn_reason,
-                reference_no
-            ) VALUES (?, 'inbound', ?, ?, ?)
-        """, (
-            int(spec_lot_id),
-            float(extra_spec_inbound_qty),
-            f"入库确认：规格化库存；操作人：{confirmed_by}",
-            batch_code
-        ))
-
-    # =========================
-    # 3. 更新生产批次：半成品清零，成品库存更新
-    # =========================
-    cursor.execute("""
-        UPDATE production_batch
-        SET finished_wh_qty = ?,
-            semi_finished_wh_qty = 0,
-            actual_qty = ?,
-            production_flow_status = 'inbound_done'
-        WHERE production_batch_id = ?
-    """, (
-        float(inbound_qty),
-        float(inbound_qty),
-        int(production_batch_id)
-    ))
-
-    # =========================
-    # 4. 更新交付批次状态
-    # 注意：这里不更新 actual_delivery_qty，因为 actual_delivery_qty 应该由出货完成后更新
-    # =========================
-    if pd.notna(delivery_plan_id):
-        cursor.execute("""
-            UPDATE delivery_plan
-            SET delivery_status = '已入库'
-            WHERE delivery_plan_id = ?
-        """, (
-            int(delivery_plan_id),
-        ))
-
-    conn.commit()
-
-    # =========================
-    # 5. 半成品流水：入库转出
-    # =========================
-    if "record_semi_finished_txn" in globals():
-        record_semi_finished_txn(
-            conn=conn,
-            production_batch_id=int(production_batch_id),
-            batch_code=batch_code,
-            txn_type="finished_inbound",
-            qty_before=float(semi_finished_qty),
-            qty_after=0,
-            txn_reason=(
-                f"成品入库确认；入库数量 {inbound_qty:.0f}；"
-                f"订单库存 {order_linked_inbound_qty:.0f}；"
-                f"规格化库存 {extra_spec_inbound_qty:.0f}"
-            ),
-            operator_name=confirmed_by,
-            reference_no=batch_code
-        )
-
-    # =========================
-    # 6. 统一同步交付批次 / 订单状态
-    # =========================
-    if pd.notna(delivery_plan_id):
-        if "sync_after_delivery_plan_change" in globals():
-            sync_after_delivery_plan_change(
-                conn,
-                int(delivery_plan_id)
+            lot_id = insert_inventory_lot_safely(
+                conn=conn,
+                lot_code=order_lot_code,
+                production_batch_id=batch_id,
+                product_id=product_id,
+                spec_id=spec_id,
+                trace_key=trace_key,
+                location=order_location,
+                available_qty=order_stock_qty,
+                release_status="released",
+                lot_status="available"
             )
 
-    if extra_spec_inbound_qty > 0:
+            created_lot_ids.append(lot_id)
+
+            insert_inventory_txn_safely(
+                conn=conn,
+                inventory_lot_id=lot_id,
+                txn_type="IN",
+                qty=order_stock_qty,
+                txn_reason=(
+                    f"仓储确认入库：订单库存；"
+                    f"数量来自端检后数量；确认人 {confirmed_by}"
+                ),
+                reference_no=f"IN-{batch_code}-ORDER"
+            )
+
+        # =========================
+        # 2. 规格化库存 WH-SPEC
+        # =========================
+        if spec_stock_qty > 0:
+            spec_location = "WH-SPEC"
+            spec_lot_code = f"LOT-{batch_code}-SPEC"
+
+            lot_id = insert_inventory_lot_safely(
+                conn=conn,
+                lot_code=spec_lot_code,
+                production_batch_id=batch_id,
+                product_id=product_id,
+                spec_id=spec_id,
+                trace_key=trace_key,
+                location=spec_location,
+                available_qty=spec_stock_qty,
+                release_status="released",
+                lot_status="available"
+            )
+
+            created_lot_ids.append(lot_id)
+
+            insert_inventory_txn_safely(
+                conn=conn,
+                inventory_lot_id=lot_id,
+                txn_type="IN",
+                qty=spec_stock_qty,
+                txn_reason=(
+                    f"仓储确认入库：规格化库存；"
+                    f"数量来自端检后超出计划交付部分；确认人 {confirmed_by}"
+                ),
+                reference_no=f"IN-{batch_code}-SPEC"
+            )
+
+        # =========================
+        # 3. 更新生产批次
+        # =========================
+        cursor.execute("""
+            UPDATE production_batch
+            SET actual_qty = ?,
+                finished_wh_qty = ?,
+                semi_finished_wh_qty = 0,
+                production_flow_status = '已入库'
+            WHERE production_batch_id = ?
+        """, (
+            float(inbound_qty),
+            float(inbound_qty),
+            batch_id
+        ))
+
+        # =========================
+        # 4. 更新交付批次
+        # =========================
+        if pd.notna(delivery_plan_id):
+            cursor.execute("""
+                UPDATE delivery_plan
+                SET delivery_status = '已入库'
+                WHERE delivery_plan_id = ?
+            """, (
+                int(delivery_plan_id),
+            ))
+
+        # =========================
+        # 5. 更新订单明细 fulfilled_qty
+        # =========================
+        if pd.notna(order_item_id):
+            cursor.execute("""
+                UPDATE order_item
+                SET fulfilled_qty = COALESCE(fulfilled_qty, 0) + ?
+                WHERE order_item_id = ?
+            """, (
+                float(order_stock_qty),
+                int(order_item_id)
+            ))
+
+        conn.commit()
+
+        if (
+            pd.notna(delivery_plan_id)
+            and "sync_after_delivery_plan_change" in globals()
+        ):
+            sync_after_delivery_plan_change(conn, int(delivery_plan_id))
+
         return True, (
-            f"入库确认完成。"
-            f"订单库存 {order_linked_inbound_qty:.0f}，"
-            f"规格化库存 {extra_spec_inbound_qty:.0f}，"
-            f"半成品库存已清零，生产状态已更新为 inbound_done。"
+            f"入库确认完成。总入库 {inbound_qty:.0f}；"
+            f"订单库存 {order_stock_qty:.0f}；"
+            f"规格化库存 {spec_stock_qty:.0f}。"
+            "数量来源：端检后数量。"
         )
 
-    return True, (
-        f"入库确认完成。"
-        f"订单库存 {order_linked_inbound_qty:.0f}，"
-        f"半成品库存已清零，生产状态已更新为 inbound_done。"
-    )
+    except Exception as e:
+        conn.rollback()
+        return False, f"入库确认失败：{e}"
 
 
 
@@ -13207,12 +13168,16 @@ def page_production_dashboard(conn):
 
 def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"):
     """
-    入库确认公共区块。
-    现在放在仓储总看板中使用。
-    逻辑：
-    - 只显示 release_status = released 且尚未入库 / 待入库确认的生产批次
-    - 确认后调用 confirm_batch_inbound_to_inventory()
-    - 自动分类入库：WH-ORDER / WH-SPEC
+    仓储总看板：入库确认公共区块。
+
+    只显示：
+    - 质检 release_status = released
+    - delivery_status = 待入库确认
+    - 尚未正式入库的批次
+
+    显示和入库都优先使用：
+    - End Inspection output_qty
+    - qc_after_qty
     """
 
     st.subheader("入库确认")
@@ -13223,6 +13188,9 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
             pb.batch_code,
             pb.trace_key,
             COALESCE(pb.actual_qty, 0) AS actual_qty,
+            COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+            COALESCE(pm.qc_after_qty, pb.semi_finished_wh_qty, pb.actual_qty, 0) AS inbound_ready_qty,
+            COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
             COALESCE(pb.required_production_qty, 0) AS required_production_qty,
 
             ps.production_schedule_id,
@@ -13242,7 +13210,10 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
             COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS material,
 
             pm.quality_status,
-            pm.release_status,
+            COALESCE(pm.release_status, 'pending') AS release_status,
+            COALESCE(pm.qc_before_qty, 0) AS qc_before_qty,
+            COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
+            COALESCE(pm.qc_loss_qty, 0) AS qc_loss_qty,
 
             il.inventory_lot_id,
             il.lot_code,
@@ -13250,6 +13221,7 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
             il.available_qty,
             il.lot_status,
             il.release_status AS lot_release_status
+
         FROM production_batch pb
         JOIN production_schedule ps
             ON pb.production_batch_id = ps.production_batch_id
@@ -13265,11 +13237,10 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
             ON pb.production_batch_id = pm.production_batch_id
         LEFT JOIN inventory_lot il
             ON pb.production_batch_id = il.production_batch_id
+
         WHERE lower(COALESCE(pm.release_status, 'pending')) = 'released'
-          AND (
-                il.inventory_lot_id IS NULL
-                OR COALESCE(dp.delivery_status, '') = '待入库确认'
-              )
+          AND COALESCE(dp.delivery_status, '') = '待入库确认'
+
         ORDER BY ps.production_schedule_id DESC
     """, conn)
 
@@ -13277,120 +13248,118 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
         st.success("当前没有待入库确认的批次。")
         return
 
-    st.info(
-        "这里负责正式入库确认。系统会自动分类："
-        "计划交付数量以内进入 WH-ORDER；超过计划交付数量的部分进入 WH-SPEC。"
+    # 如果同一批次已有多个 lot，去重显示主批次
+    inbound_main_df = inbound_df.drop_duplicates(
+        subset=["production_batch_id"]
+    ).copy()
+
+    # 再次按函数计算最终待入库数量，确保显示值和入库执行值一致
+    inbound_main_df["final_inbound_qty"] = inbound_main_df["production_batch_id"].apply(
+        lambda x: get_final_inbound_ready_qty(conn, int(x))
+        if "get_final_inbound_ready_qty" in globals()
+        else 0.0
     )
 
-    show_df(inbound_df.rename(columns={
+    st.info(
+        "这里负责正式入库确认。"
+        "入库数量强制使用端检后数量；"
+        "计划交付数量以内进入 WH-ORDER，超出部分进入 WH-SPEC。"
+    )
+
+    show_df(inbound_main_df[[
+        "delivery_status",
+        "production_batch_id",
+        "batch_code",
+        "customer_name",
+        "po_no",
+        "delivery_batch_no",
+        "planned_delivery_qty",
+        "actual_qty",
+        "semi_finished_wh_qty",
+        "qc_before_qty",
+        "qc_after_qty",
+        "qc_loss_qty",
+        "final_inbound_qty",
+        "quality_status",
+        "release_status",
+        "trace_key"
+    ]].rename(columns={
+        "delivery_status": "交付状态",
         "production_batch_id": "生产批次编号",
         "batch_code": "生产批号",
-        "actual_qty": "实际生产数量",
-        "required_production_qty": "应生产数量",
-        "delivery_batch_no": "交付批次",
-        "planned_delivery_qty": "计划交付数量",
-        "actual_delivery_qty": "已交付数量",
-        "delivery_status": "交付状态",
         "customer_name": "客户",
         "po_no": "PO",
-        "customer_pn": "客户料号",
-        "product_type_text": "产品",
-        "product_spec_text": "规格",
-        "special_process": "特殊工艺",
-        "material": "材质",
+        "delivery_batch_no": "交付批次",
+        "planned_delivery_qty": "计划交付数量",
+        "actual_qty": "当前有效数量",
+        "semi_finished_wh_qty": "半成品账面数量",
+        "qc_before_qty": "端检前数量",
+        "qc_after_qty": "端检后数量",
+        "qc_loss_qty": "端检损耗",
+        "final_inbound_qty": "最终待入库数量",
         "quality_status": "质量等级",
         "release_status": "放行状态",
-        "lot_code": "Lot号",
-        "location": "当前库位",
-        "available_qty": "当前库存数量"
+        "trace_key": "Trace Key"
     }), hide_index=True)
 
-    st.markdown("---")
-
-    default_batch_id = st.session_state.get("selected_inbound_batch_id", None)
-    inbound_batch_ids = [int(x) for x in inbound_df["production_batch_id"].tolist()]
-
-    default_index = 0
-    if default_batch_id in inbound_batch_ids:
-        default_index = inbound_batch_ids.index(default_batch_id)
-
     selected_batch_id = st.selectbox(
-        "选择待入库批次",
-        inbound_batch_ids,
-        index=default_index,
+        "选择批次进行正式入库确认",
+        inbound_main_df["production_batch_id"].tolist(),
         format_func=lambda x: (
-            f"{x} | "
-            f"{inbound_df.loc[inbound_df['production_batch_id'] == x, 'batch_code'].iloc[0]} | "
-            f"PO {inbound_df.loc[inbound_df['production_batch_id'] == x, 'po_no'].iloc[0]} | "
-            f"实际生产 {float(inbound_df.loc[inbound_df['production_batch_id'] == x, 'actual_qty'].iloc[0]):.0f} | "
-            f"计划交付 {float(inbound_df.loc[inbound_df['production_batch_id'] == x, 'planned_delivery_qty'].iloc[0]):.0f}"
+            f"[待入库确认] "
+            f"批次 {inbound_main_df.loc[inbound_main_df['production_batch_id'] == x, 'batch_code'].iloc[0]}｜"
+            f"PO {inbound_main_df.loc[inbound_main_df['production_batch_id'] == x, 'po_no'].iloc[0]}｜"
+            f"待入库 {float(inbound_main_df.loc[inbound_main_df['production_batch_id'] == x, 'final_inbound_qty'].iloc[0] or 0):.0f}"
         ),
         key=f"{section_key_prefix}_inbound_batch_select"
     )
 
-    selected = inbound_df[inbound_df["production_batch_id"] == selected_batch_id].iloc[0]
+    selected = inbound_main_df[
+        inbound_main_df["production_batch_id"] == selected_batch_id
+    ].iloc[0]
 
-    actual_qty = float(selected["actual_qty"] or 0)
-    planned_delivery_qty = float(selected["planned_delivery_qty"] or 0)
-    order_inbound_qty = min(actual_qty, planned_delivery_qty)
-    spec_inbound_qty = max(actual_qty - planned_delivery_qty, 0)
+    final_inbound_qty = float(selected["final_inbound_qty"] or 0)
+    planned_qty = float(selected["planned_delivery_qty"] or 0)
+    order_stock_qty = min(final_inbound_qty, planned_qty) if planned_qty > 0 else final_inbound_qty
+    spec_stock_qty = max(final_inbound_qty - order_stock_qty, 0.0)
 
-    st.markdown("### 入库确认卡片")
+    st.markdown("### 入库确认批次卡片")
 
     i1, i2, i3, i4 = st.columns(4)
     i1.metric("生产批号", str(selected["batch_code"]))
     i2.metric("PO", str(selected["po_no"]))
-    i3.metric("实际生产数量", f"{actual_qty:.0f}")
+    i3.metric("最终待入库数量", f"{final_inbound_qty:.0f}")
     i4.metric("交付状态", str(selected["delivery_status"]))
 
     i5, i6, i7, i8 = st.columns(4)
-    i5.metric("产品", str(selected["product_type_text"]))
-    i6.metric("规格", str(selected["product_spec_text"]))
-    i7.metric("质量等级", str(selected["quality_status"]))
+    i5.metric("端检前数量", f"{float(selected['qc_before_qty'] or 0):.0f}")
+    i6.metric("端检后数量", f"{float(selected['qc_after_qty'] or 0):.0f}")
+    i7.metric("端检损耗", f"{float(selected['qc_loss_qty'] or 0):.0f}")
     i8.metric("放行状态", str(selected["release_status"]))
 
-    st.markdown("### 自动分类结果预览")
-
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("计划交付数量", f"{planned_delivery_qty:.0f}")
-    p2.metric("应生产数量", f"{float(selected['required_production_qty'] or 0):.0f}")
-    p3.metric("订单库存 WH-ORDER", f"{order_inbound_qty:.0f}")
-    p4.metric("规格化库存 WH-SPEC", f"{spec_inbound_qty:.0f}")
-
-    if actual_qty < planned_delivery_qty:
-        st.warning(
-            f"实际生产数量 {actual_qty:.0f} 小于计划交付数量 {planned_delivery_qty:.0f}，"
-            "本次只能入订单库存，后续出货可能库存不足。"
-        )
-    elif spec_inbound_qty > 0:
-        st.success(
-            f"实际生产数量超过计划交付数量，超出 {spec_inbound_qty:.0f} 将自动进入规格化库存 WH-SPEC。"
-        )
-    else:
-        st.info("实际生产数量等于计划交付数量，全部进入订单库存 WH-ORDER。")
+    i9, i10, i11 = st.columns(3)
+    i9.metric("计划交付数量", f"{planned_qty:.0f}")
+    i10.metric("进入订单库存 WH-ORDER", f"{order_stock_qty:.0f}")
+    i11.metric("进入规格化库存 WH-SPEC", f"{spec_stock_qty:.0f}")
 
     st.markdown("Trace Key")
     st.code(str(selected["trace_key"]))
 
-    with st.form(f"{section_key_prefix}_inbound_confirm_form"):
+    with st.form(key=f"{section_key_prefix}_inbound_confirm_form_{int(selected_batch_id)}"):
         confirmed_by = st.text_input(
             "入库确认人",
             value="Warehouse User",
-            key=f"{section_key_prefix}_inbound_confirmed_by"
+            key=f"{section_key_prefix}_inbound_confirmed_by_{int(selected_batch_id)}"
         )
 
-        final_check = st.checkbox(
-            "我已核对生产批号、PO、交付批次、质量放行状态和入库数量，确认可以入库。",
-            key=f"{section_key_prefix}_inbound_final_check"
+        st.warning(
+            "确认后系统将以【端检后数量】作为正式入库数量，"
+            "并将半成品数量清零、成品仓数量更新、交付状态改为已入库。"
         )
 
-        submitted = st.form_submit_button("确认入库并同步仓储数据")
+        submitted = st.form_submit_button("确认入库并同步库存")
 
     if submitted:
-        if not final_check:
-            st.error("请先勾选入库确认。")
-            return
-
         ok, msg = confirm_batch_inbound_to_inventory(
             conn=conn,
             production_batch_id=int(selected_batch_id),
@@ -13404,7 +13373,6 @@ def render_inbound_confirm_section(conn, section_key_prefix="warehouse_overview"
             st.rerun()
         else:
             st.error(msg)
-
 
 def page_inventory_overview(conn):
     st.header("仓储｜仓储总看板")
@@ -13610,7 +13578,10 @@ def page_inventory_overview(conn):
                 show_df(order_df, hide_index=True)
 
     with tab_spec:
-        st.subheader("规格化库存 WH-SPEC")
+        render_spec_stock_query_section(
+            conn,
+            section_key_prefix="warehouse_overview"
+        )
 
         if stock_df.empty:
             st.info("当前没有规格化库存。")
@@ -13661,12 +13632,468 @@ def page_inventory_overview(conn):
             show_df(txn_df, hide_index=True)
 
 
+# =========================
+# 退货再上架：进入规格化库存 WH-SPEC
+# 口径：产品规格 + 特殊工艺 + 材质
+# =========================
+
+def get_spec_stock_key_for_inventory(spec_code, special_process, material):
+    """
+    规格化库存 Key：
+    SPEC_STOCK + 产品规格 + 特殊工艺 + 材质
+
+    注意：
+    - 不包含 PO
+    - 不包含客户
+    - 用于退货再上架、超产入库、规格化库存聚合查询
+    """
+    return "__".join([
+        "SPEC_STOCK",
+        normalize_trace_part(spec_code, "NOSPEC"),
+        normalize_trace_part(special_process, "STANDARD"),
+        normalize_trace_part(material, "UNKNOWN_MATERIAL"),
+    ])
+
+
+def find_or_create_spec_stock_lot(
+    conn,
+    product_id,
+    spec_id,
+    spec_code,
+    special_process,
+    material,
+    qty,
+    reason,
+    operator_name="Warehouse User",
+    source_ref="RETURN_RESTOCK"
+):
+    """
+    找到或创建规格化库存 Lot。
+
+    聚合逻辑：
+    - product_id
+    - spec_id
+    - special_process
+    - material
+    - location = WH-SPEC
+    - trace_key = SPEC_STOCK + spec_code + special_process + material
+
+    如果已有 Lot：
+    - available_qty += qty
+    - 写库存流水 RETURN_RESTOCK
+
+    如果没有 Lot：
+    - 新建 Lot
+    - 写库存流水 RETURN_RESTOCK
+    """
+
+    cursor = conn.cursor()
+
+    qty = float(qty or 0)
+    if qty <= 0:
+        return False, "退货再上架数量必须大于 0。"
+
+    spec_code_clean = normalize_text(spec_code).upper()
+    special_process_clean = normalize_text(special_process).upper() or "STANDARD"
+    material_clean = normalize_text(material).upper() or "UNKNOWN_MATERIAL"
+
+    spec_stock_key = get_spec_stock_key_for_inventory(
+        spec_code=spec_code_clean,
+        special_process=special_process_clean,
+        material=material_clean
+    )
+
+    reason_clean = normalize_text(reason) or "退货再上架"
+    operator_clean = normalize_text(operator_name) or "Warehouse User"
+    source_ref_clean = normalize_text(source_ref) or "RETURN_RESTOCK"
+
+    try:
+        # =========================
+        # 1. 查找同规格 + 工艺 + 材质的 WH-SPEC Lot
+        # =========================
+        lot_df = pd.read_sql_query("""
+            SELECT
+                inventory_lot_id,
+                lot_code,
+                COALESCE(available_qty, 0) AS available_qty,
+                COALESCE(reserved_qty, 0) AS reserved_qty
+            FROM inventory_lot
+            WHERE location = 'WH-SPEC'
+              AND spec_id = ?
+              AND trace_key = ?
+              AND COALESCE(lot_status, 'available') = 'available'
+              AND COALESCE(release_status, 'released') = 'released'
+            ORDER BY inventory_lot_id
+            LIMIT 1
+        """, conn, params=[
+            int(spec_id),
+            spec_stock_key
+        ])
+
+        if lot_df.empty:
+            # =========================
+            # 2. 没有则新建规格化库存 Lot
+            # =========================
+            safe_spec = normalize_trace_part(spec_code_clean, "NOSPEC")
+            safe_process = normalize_trace_part(special_process_clean, "STANDARD")
+            safe_material = normalize_trace_part(material_clean, "UNKNOWN_MATERIAL")
+
+            lot_code = f"LOT-SPEC-{safe_spec}-{safe_process}-{safe_material}"
+
+            inventory_lot_cols = pd.read_sql_query(
+                "PRAGMA table_info(inventory_lot)",
+                conn
+            )["name"].tolist()
+
+            lot_data = {
+                "lot_code": lot_code,
+                "production_batch_id": None,
+                "product_id": int(product_id),
+                "spec_id": int(spec_id),
+                "trace_key": spec_stock_key,
+                "location": "WH-SPEC",
+                "available_qty": qty,
+                "reserved_qty": 0,
+                "lot_status": "available",
+                "release_status": "released",
+                "exclusive_customer": "",
+                "forbidden_customer": "",
+                "last_out_qty": 0,
+                "last_out_time": None,
+            }
+
+            insert_cols = [c for c in lot_data.keys() if c in inventory_lot_cols]
+            placeholders = ", ".join(["?"] * len(insert_cols))
+            col_sql = ", ".join(insert_cols)
+
+            cursor.execute(
+                f"""
+                INSERT INTO inventory_lot ({col_sql})
+                VALUES ({placeholders})
+                """,
+                [lot_data[c] for c in insert_cols]
+            )
+
+            inventory_lot_id = cursor.lastrowid
+            qty_before = 0.0
+            qty_after = qty
+            action_msg = "已新建规格化库存 Lot"
+
+        else:
+            # =========================
+            # 3. 已有则增加 available_qty
+            # =========================
+            lot = lot_df.iloc[0]
+            inventory_lot_id = int(lot["inventory_lot_id"])
+            lot_code = str(lot["lot_code"])
+            qty_before = float(lot["available_qty"] or 0)
+            qty_after = qty_before + qty
+
+            cursor.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) + ?,
+                    lot_status = 'available',
+                    release_status = 'released'
+                WHERE inventory_lot_id = ?
+            """, (
+                qty,
+                inventory_lot_id
+            ))
+
+            action_msg = "已合并到已有规格化库存 Lot"
+
+        # =========================
+        # 4. 写库存流水
+        # =========================
+        txn_cols = pd.read_sql_query(
+            "PRAGMA table_info(inventory_transaction_log)",
+            conn
+        )["name"].tolist()
+
+        txn_data = {
+            "inventory_lot_id": int(inventory_lot_id),
+            "txn_type": "RETURN_RESTOCK",
+            "qty": qty,
+            "txn_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "txn_reason": (
+                f"退货再上架进入规格化库存；"
+                f"规格={spec_code_clean}；"
+                f"特殊工艺={special_process_clean}；"
+                f"材质={material_clean}；"
+                f"原因={reason_clean}；"
+                f"操作人={operator_clean}；"
+                f"变动前={qty_before:.0f}；变动后={qty_after:.0f}"
+            ),
+            "reference_no": source_ref_clean,
+        }
+
+        insert_txn_cols = [c for c in txn_data.keys() if c in txn_cols]
+        txn_placeholders = ", ".join(["?"] * len(insert_txn_cols))
+        txn_col_sql = ", ".join(insert_txn_cols)
+
+        cursor.execute(
+            f"""
+            INSERT INTO inventory_transaction_log ({txn_col_sql})
+            VALUES ({txn_placeholders})
+            """,
+            [txn_data[c] for c in insert_txn_cols]
+        )
+
+        conn.commit()
+
+        return True, (
+            f"{action_msg}：{lot_code}。"
+            f"本次上架 {qty:.0f}，"
+            f"上架后可用数量 {qty_after:.0f}。"
+            f"规格化库存 Key：{spec_stock_key}"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"退货再上架失败：{e}"
+
+
+def page_return_restock_to_spec_inventory(conn):
+    """
+    退货再上架页面：
+    将退回产品按 产品规格 + 特殊工艺 + 材质 进入 WH-SPEC 规格化库存。
+    """
+
+    st.header("仓储｜退货再上架")
+
+    st.info(
+        "退货再上架不会回到原订单库存，而是按【产品规格 + 特殊工艺 + 材质】"
+        "进入 WH-SPEC 规格化库存池。"
+        "这样后续销售可以按规格整体检索，再用特殊工艺和材质精确匹配。"
+    )
+
+    # =========================
+    # 1. 读取产品规格
+    # =========================
+    spec_df = pd.read_sql_query("""
+        SELECT
+            ps.spec_id,
+            ps.spec_code,
+            ps.spec_desc,
+            ps.outer_diameter_mm,
+            ps.wall_thickness_mm,
+            ps.length_mm,
+            p.product_id,
+            p.product_name,
+            p.product_code
+        FROM product_spec ps
+        JOIN product p
+            ON ps.product_id = p.product_id
+        WHERE COALESCE(ps.is_enabled, 1) = 1
+          AND COALESCE(p.is_enabled, 1) = 1
+        ORDER BY p.product_name, ps.spec_code
+    """, conn)
+
+    if spec_df.empty:
+        st.error("当前没有启用的产品规格，请先在【基础选项管理 → 产品规格管理】维护产品规格。")
+        return
+
+    # =========================
+    # 2. 读取特殊工艺 / 材质
+    # =========================
+    if "get_business_options" in globals():
+        special_process_options = get_business_options(
+            conn,
+            "special_process",
+            ["STANDARD", "LASER", "CHAMFER", "DRILLING"]
+        )
+
+        material_options = get_business_options(
+            conn,
+            "material",
+            ["BOROSILICATE", "QUARTZ", "SODA-LIME"]
+        )
+    else:
+        special_process_options = ["STANDARD", "LASER", "CHAMFER", "DRILLING"]
+        material_options = ["BOROSILICATE", "QUARTZ", "SODA-LIME"]
+
+    st.markdown("### 退货产品信息")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        selected_spec_id = st.selectbox(
+            "产品规格",
+            spec_df["spec_id"].tolist(),
+            format_func=lambda x: (
+                f"{spec_df.loc[spec_df['spec_id'] == x, 'product_name'].iloc[0]}"
+                f"｜{spec_df.loc[spec_df['spec_id'] == x, 'spec_code'].iloc[0]}"
+            ),
+            key="return_restock_spec_id"
+        )
+
+    selected_spec = spec_df[spec_df["spec_id"] == selected_spec_id].iloc[0]
+
+    with c2:
+        special_process = st.selectbox(
+            "特殊工艺",
+            special_process_options,
+            index=0,
+            key="return_restock_special_process"
+        )
+
+    with c3:
+        material = st.selectbox(
+            "材质",
+            material_options,
+            index=0,
+            key="return_restock_material"
+        )
+
+    spec_code = normalize_text(selected_spec["spec_code"]).upper()
+    product_id = int(selected_spec["product_id"])
+    spec_id = int(selected_spec["spec_id"])
+
+    st.caption(
+        f"产品：{selected_spec['product_name']} ｜ "
+        f"规格编码：{selected_spec['spec_code']} ｜ "
+        f"规格描述：{selected_spec['spec_desc']} ｜ "
+        f"外径：{selected_spec['outer_diameter_mm']} mm ｜ "
+        f"壁厚：{selected_spec['wall_thickness_mm']} mm ｜ "
+        f"长度：{selected_spec['length_mm']} mm"
+    )
+
+    spec_stock_key = get_spec_stock_key_for_inventory(
+        spec_code=spec_code,
+        special_process=special_process,
+        material=material
+    )
+
+    st.markdown("### 将进入的规格化库存池")
+    st.code(spec_stock_key)
+
+    # =========================
+    # 3. 当前库存池现有数量
+    # =========================
+    current_pool_df = pd.read_sql_query("""
+        SELECT
+            inventory_lot_id,
+            lot_code,
+            location,
+            available_qty,
+            reserved_qty,
+            COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0) AS total_qty,
+            lot_status,
+            release_status,
+            trace_key
+        FROM inventory_lot
+        WHERE location = 'WH-SPEC'
+          AND spec_id = ?
+          AND trace_key = ?
+        ORDER BY inventory_lot_id
+    """, conn, params=[
+        int(spec_id),
+        spec_stock_key
+    ])
+
+    if current_pool_df.empty:
+        st.warning("当前规格 + 特殊工艺 + 材质还没有规格化库存 Lot，本次上架将自动创建。")
+        current_available_qty = 0.0
+    else:
+        current_available_qty = pd.to_numeric(
+            current_pool_df["available_qty"],
+            errors="coerce"
+        ).fillna(0).sum()
+
+        st.success(f"当前库存池已有可用数量：{current_available_qty:.0f}")
+
+        with st.expander("查看当前库存池 Lot", expanded=False):
+            show_df(current_pool_df.rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "location": "库位",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "total_qty": "总数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "trace_key": "规格化库存Key"
+            }), hide_index=True)
+
+    # =========================
+    # 4. 上架表单
+    # =========================
+    st.markdown("---")
+    st.markdown("### 退货再上架录入")
+
+    with st.form("return_restock_to_spec_inventory_form"):
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+            return_qty = st.number_input(
+                "退货再上架数量",
+                min_value=1.0,
+                value=1.0,
+                step=1.0,
+                key="return_restock_qty"
+            )
+
+        with r2:
+            operator_name = st.text_input(
+                "操作人",
+                value="Warehouse User",
+                key="return_restock_operator"
+            )
+
+        with r3:
+            source_ref = st.text_input(
+                "参考单号 / 退货单号",
+                value=f"RETURN-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                key="return_restock_source_ref"
+            )
+
+        reason = st.text_area(
+            "退货 / 再上架原因",
+            value="客户退货再上架至规格化库存",
+            key="return_restock_reason"
+        )
+
+        submitted = st.form_submit_button("确认退货再上架")
+
+    if submitted:
+        ok, msg = find_or_create_spec_stock_lot(
+            conn=conn,
+            product_id=product_id,
+            spec_id=spec_id,
+            spec_code=spec_code,
+            special_process=special_process,
+            material=material,
+            qty=float(return_qty),
+            reason=reason,
+            operator_name=operator_name,
+            source_ref=source_ref
+        )
+
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    st.markdown("---")
+
+    # =========================
+    # 5. 下方直接复用规格化库存查询区块
+    # =========================
+    if "render_spec_stock_query_section" in globals():
+        render_spec_stock_query_section(
+            conn,
+            section_key_prefix="return_restock_spec_stock_query"
+        )
+
+
 def page_inventory_lot(conn):
     st.header("库存")
 
     st.info(
-        "库存页面现在只用于查看库存明细。"
-        "正式入库请进入【仓储总看板 → 入库确认】。"
+        "库存页面用于查看库存明细。"
+        "订单库存 WH-ORDER 按订单 / Trace Key 追踪；"
+        "规格化库存 WH-SPEC 按 产品规格 + 特殊工艺 + 材质 聚合查询。"
     )
 
     stock_df = pd.read_sql_query("""
@@ -13687,27 +14114,54 @@ def page_inventory_lot(conn):
             il.forbidden_customer,
             il.last_out_qty,
             il.last_out_time,
+
             ps.spec_code,
+            ps.spec_desc,
             p.product_name,
+            p.product_code,
+
+            COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS special_process,
+            COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS material,
+
+            pb.batch_code,
+            c.customer_name,
+            oi.po_no,
+
             CASE
                 WHEN il.location = 'WH-ORDER' THEN '订单库存'
                 WHEN il.location = 'WH-SPEC' THEN '规格化库存'
                 WHEN il.trace_key LIKE 'SPEC_STOCK%' THEN '规格化库存'
                 ELSE '其他库存'
             END AS stock_type
+
         FROM inventory_lot il
         LEFT JOIN product_spec ps
             ON il.spec_id = ps.spec_id
         LEFT JOIN product p
             ON il.product_id = p.product_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
         ORDER BY
             stock_type,
+            ps.spec_code,
+            special_process,
+            material,
             il.inventory_lot_id
     """, conn)
 
     if stock_df.empty:
         order_stock_qty = 0
         spec_stock_qty = 0
+        other_stock_qty = 0
         total_stock_qty = 0
     else:
         order_stock_qty = stock_df.loc[
@@ -13720,12 +14174,18 @@ def page_inventory_lot(conn):
             "lot_total_qty"
         ].sum()
 
-        total_stock_qty = order_stock_qty + spec_stock_qty
+        other_stock_qty = stock_df.loc[
+            stock_df["stock_type"] == "其他库存",
+            "lot_total_qty"
+        ].sum()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("总库存", f"{total_stock_qty:.0f}")
-    c2.metric("订单库存", f"{order_stock_qty:.0f}")
-    c3.metric("规格化库存", f"{spec_stock_qty:.0f}")
+        total_stock_qty = order_stock_qty + spec_stock_qty + other_stock_qty
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总库存", f"{float(total_stock_qty):.0f}")
+    c2.metric("订单库存 WH-ORDER", f"{float(order_stock_qty):.0f}")
+    c3.metric("规格化库存 WH-SPEC", f"{float(spec_stock_qty):.0f}")
+    c4.metric("其他库存", f"{float(other_stock_qty):.0f}")
 
     st.markdown("---")
 
@@ -13738,32 +14198,74 @@ def page_inventory_lot(conn):
 
     with tab_all:
         st.subheader("库存总览")
+
         if stock_df.empty:
             st.info("当前没有库存。")
         else:
-            show_df(stock_df, hide_index=True)
+            show_df(stock_df.rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "production_batch_id": "生产批次编号",
+                "product_id": "产品编号",
+                "spec_id": "规格编号",
+                "trace_key": "Trace Key",
+                "location": "库位",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "lot_total_qty": "总数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "exclusive_customer": "专供客户",
+                "forbidden_customer": "禁用客户",
+                "last_out_qty": "最近出库数量",
+                "last_out_time": "最近出库时间",
+                "spec_code": "规格编码",
+                "spec_desc": "规格描述",
+                "product_name": "产品名称",
+                "product_code": "产品编码",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "batch_code": "来源生产批号",
+                "customer_name": "来源客户",
+                "po_no": "来源PO",
+                "stock_type": "库存类型"
+            }), hide_index=True)
 
     with tab_order:
-        st.subheader("订单库存")
+        st.subheader("订单库存 WH-ORDER")
+
         if stock_df.empty:
             st.info("当前没有订单库存。")
         else:
             order_df = stock_df[stock_df["stock_type"] == "订单库存"].copy()
+
             if order_df.empty:
                 st.info("当前没有订单库存。")
             else:
-                show_df(order_df, hide_index=True)
+                show_df(order_df.rename(columns={
+                    "inventory_lot_id": "Lot编号",
+                    "lot_code": "Lot号",
+                    "location": "库位",
+                    "available_qty": "可用数量",
+                    "reserved_qty": "预留数量",
+                    "lot_total_qty": "总数量",
+                    "lot_status": "Lot状态",
+                    "release_status": "放行状态",
+                    "spec_code": "规格编码",
+                    "product_name": "产品名称",
+                    "special_process": "特殊工艺",
+                    "material": "材质",
+                    "batch_code": "来源生产批号",
+                    "customer_name": "来源客户",
+                    "po_no": "来源PO",
+                    "trace_key": "Trace Key"
+                }), hide_index=True)
 
     with tab_spec:
-        st.subheader("规格化库存")
-        if stock_df.empty:
-            st.info("当前没有规格化库存。")
-        else:
-            spec_df = stock_df[stock_df["stock_type"] == "规格化库存"].copy()
-            if spec_df.empty:
-                st.info("当前没有规格化库存。")
-            else:
-                show_df(spec_df, hide_index=True)
+        render_spec_stock_query_section(
+            conn,
+            section_key_prefix="inventory_lot_page"
+        )
 
     with tab_txn:
         st.subheader("库存流水")
@@ -13789,7 +14291,464 @@ def page_inventory_lot(conn):
         if txn_df.empty:
             st.info("当前没有库存流水。")
         else:
-            show_df(txn_df, hide_index=True)
+            show_df(txn_df.rename(columns={
+                "txn_id": "流水编号",
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "location": "库位",
+                "trace_key": "Trace Key",
+                "txn_type": "交易类型",
+                "qty": "数量",
+                "txn_time": "交易时间",
+                "txn_reason": "交易原因",
+                "reference_no": "参考单号"
+            }), hide_index=True)
+
+
+# =========================
+# 规格化库存查询工具
+# 口径：产品规格 + 特殊工艺 + 材质
+# =========================
+
+def build_spec_stock_group_key(spec_code, special_process, material):
+    """
+    规格化库存聚合 Key：
+    SPEC_STOCK + 产品规格 + 特殊工艺 + 材质
+
+    注意：
+    - 不包含 PO
+    - 不包含客户
+    - 用于 WH-SPEC 规格化库存池
+    """
+    return "__".join([
+        "SPEC_STOCK",
+        normalize_trace_part(spec_code, "NOSPEC"),
+        normalize_trace_part(special_process, "STANDARD"),
+        normalize_trace_part(material, "UNKNOWN_MATERIAL"),
+    ])
+
+
+def get_spec_stock_base_df(conn):
+    """
+    读取规格化库存明细基础表。
+
+    规格化库存识别规则：
+    - il.location = 'WH-SPEC'
+    - 或 il.trace_key LIKE 'SPEC_STOCK%'
+
+    规格化库存分类口径：
+    - 产品规格 spec_code
+    - 特殊工艺 special_process
+    - 材质 material
+    """
+    return pd.read_sql_query("""
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.production_batch_id,
+            il.product_id,
+            il.spec_id,
+            il.trace_key,
+            il.location,
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
+            COALESCE(il.lot_status, '') AS lot_status,
+            COALESCE(il.release_status, '') AS release_status,
+            COALESCE(il.exclusive_customer, '') AS exclusive_customer,
+            COALESCE(il.forbidden_customer, '') AS forbidden_customer,
+            il.last_out_qty,
+            il.last_out_time,
+
+            ps.spec_code,
+            ps.spec_desc,
+            ps.outer_diameter_mm,
+            ps.wall_thickness_mm,
+            ps.length_mm,
+
+            p.product_name,
+            p.product_code,
+
+            COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS special_process,
+            COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS material,
+
+            pb.batch_code,
+            pb.production_flow_status,
+
+            c.customer_name,
+            oi.po_no
+
+        FROM inventory_lot il
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN product p
+            ON il.product_id = p.product_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
+        WHERE il.location = 'WH-SPEC'
+           OR il.trace_key LIKE 'SPEC_STOCK%'
+
+        ORDER BY
+            ps.spec_code,
+            special_process,
+            material,
+            il.inventory_lot_id
+    """, conn)
+
+
+def prepare_spec_stock_views(spec_base_df):
+    """
+    从规格化库存明细生成：
+    1. 明细表
+    2. 按 规格 + 特殊工艺 + 材质 聚合表
+    3. 按 产品规格 聚合表
+    """
+
+    if spec_base_df is None or spec_base_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = spec_base_df.copy()
+
+    df["spec_code"] = df["spec_code"].fillna("UNKNOWN_SPEC").astype(str)
+    df["product_name"] = df["product_name"].fillna("").astype(str)
+    df["special_process"] = df["special_process"].fillna("STANDARD").astype(str).str.upper()
+    df["material"] = df["material"].fillna("UNKNOWN_MATERIAL").astype(str).str.upper()
+
+    df["spec_stock_group_key"] = df.apply(
+        lambda r: build_spec_stock_group_key(
+            r["spec_code"],
+            r["special_process"],
+            r["material"]
+        ),
+        axis=1
+    )
+
+    df["variant_label"] = (
+        df["special_process"].astype(str)
+        + " / "
+        + df["material"].astype(str)
+    )
+
+    group_df = (
+        df.groupby([
+            "spec_id",
+            "spec_code",
+            "spec_desc",
+            "product_name",
+            "product_code",
+            "special_process",
+            "material",
+            "variant_label",
+            "spec_stock_group_key"
+        ], dropna=False)
+        .agg(
+            lot_count=("inventory_lot_id", "nunique"),
+            available_qty=("available_qty", "sum"),
+            reserved_qty=("reserved_qty", "sum"),
+            total_qty=("lot_total_qty", "sum"),
+            latest_out_time=("last_out_time", "max")
+        )
+        .reset_index()
+        .sort_values(["spec_code", "special_process", "material"])
+    )
+
+    spec_summary_df = (
+        df.groupby([
+            "spec_id",
+            "spec_code",
+            "spec_desc",
+            "product_name",
+            "product_code"
+        ], dropna=False)
+        .agg(
+            variant_count=("variant_label", "nunique"),
+            lot_count=("inventory_lot_id", "nunique"),
+            available_qty=("available_qty", "sum"),
+            reserved_qty=("reserved_qty", "sum"),
+            total_qty=("lot_total_qty", "sum")
+        )
+        .reset_index()
+        .sort_values(["spec_code"])
+    )
+
+    return df, group_df, spec_summary_df
+
+
+def render_spec_stock_query_section(conn, section_key_prefix="spec_stock"):
+    """
+    规格化库存查询区块。
+
+    查询优先级：
+    1. 产品规格整体检索
+    2. 特殊工艺筛选
+    3. 材质筛选
+    4. Lot 明细追踪
+
+    可用于：
+    - 库存页面
+    - 仓储总看板
+    - 后续退货再上架页面
+    """
+
+    st.subheader("规格化库存 WH-SPEC｜按规格 + 特殊工艺 + 材质查询")
+
+    st.info(
+        "规格化库存查询口径：优先按【产品规格】整体检索，"
+        "再用【特殊工艺 + 材质】精确定位库存池。"
+        "该口径适用于超产入库、退货再上架、非买卖调整和可售规格库存查询。"
+    )
+
+    spec_base_df = get_spec_stock_base_df(conn)
+    spec_detail_df, spec_group_df, spec_summary_df = prepare_spec_stock_views(spec_base_df)
+
+    if spec_base_df.empty:
+        st.info("当前没有规格化库存。")
+        return
+
+    total_available = float(spec_group_df["available_qty"].sum() if not spec_group_df.empty else 0)
+    total_reserved = float(spec_group_df["reserved_qty"].sum() if not spec_group_df.empty else 0)
+    total_qty = float(spec_group_df["total_qty"].sum() if not spec_group_df.empty else 0)
+    variant_count = int(spec_group_df["spec_stock_group_key"].nunique() if not spec_group_df.empty else 0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("规格化库存总量", f"{total_qty:.0f}")
+    m2.metric("可用数量", f"{total_available:.0f}")
+    m3.metric("预留数量", f"{total_reserved:.0f}")
+    m4.metric("规格变体数", variant_count)
+
+    st.markdown("---")
+
+    # =========================
+    # 筛选区：产品规格优先
+    # =========================
+    f1, f2, f3 = st.columns(3)
+
+    spec_options = ["全部"] + spec_summary_df["spec_code"].dropna().astype(str).sort_values().unique().tolist()
+
+    with f1:
+        selected_spec_code = st.selectbox(
+            "产品规格优先检索",
+            spec_options,
+            key=f"{section_key_prefix}_spec_filter"
+        )
+
+    if selected_spec_code == "全部":
+        filtered_group_df = spec_group_df.copy()
+        filtered_detail_df = spec_detail_df.copy()
+    else:
+        filtered_group_df = spec_group_df[
+            spec_group_df["spec_code"].astype(str) == selected_spec_code
+        ].copy()
+        filtered_detail_df = spec_detail_df[
+            spec_detail_df["spec_code"].astype(str) == selected_spec_code
+        ].copy()
+
+    special_process_options = ["全部"] + filtered_group_df["special_process"].dropna().astype(str).sort_values().unique().tolist()
+
+    with f2:
+        selected_special_process = st.selectbox(
+            "特殊工艺",
+            special_process_options,
+            key=f"{section_key_prefix}_special_process_filter"
+        )
+
+    if selected_special_process != "全部":
+        filtered_group_df = filtered_group_df[
+            filtered_group_df["special_process"].astype(str) == selected_special_process
+        ].copy()
+        filtered_detail_df = filtered_detail_df[
+            filtered_detail_df["special_process"].astype(str) == selected_special_process
+        ].copy()
+
+    material_options = ["全部"] + filtered_group_df["material"].dropna().astype(str).sort_values().unique().tolist()
+
+    with f3:
+        selected_material = st.selectbox(
+            "材质",
+            material_options,
+            key=f"{section_key_prefix}_material_filter"
+        )
+
+    if selected_material != "全部":
+        filtered_group_df = filtered_group_df[
+            filtered_group_df["material"].astype(str) == selected_material
+        ].copy()
+        filtered_detail_df = filtered_detail_df[
+            filtered_detail_df["material"].astype(str) == selected_material
+        ].copy()
+
+    st.markdown("---")
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("当前筛选库存", f"{float(filtered_group_df['total_qty'].sum() if not filtered_group_df.empty else 0):.0f}")
+    q2.metric("当前筛选可用", f"{float(filtered_group_df['available_qty'].sum() if not filtered_group_df.empty else 0):.0f}")
+    q3.metric("当前筛选预留", f"{float(filtered_group_df['reserved_qty'].sum() if not filtered_group_df.empty else 0):.0f}")
+    q4.metric("当前筛选库存池", int(filtered_group_df["spec_stock_group_key"].nunique() if not filtered_group_df.empty else 0))
+
+    # =========================
+    # 展示区
+    # =========================
+    tab_spec_summary, tab_variant, tab_lot = st.tabs([
+        "按产品规格汇总",
+        "按工艺 / 材质汇总",
+        "Lot 明细"
+    ])
+
+    with tab_spec_summary:
+        st.markdown("### 产品规格整体库存")
+
+        summary_show_df = spec_summary_df.copy()
+
+        if selected_spec_code != "全部":
+            summary_show_df = summary_show_df[
+                summary_show_df["spec_code"].astype(str) == selected_spec_code
+            ].copy()
+
+        show_df(summary_show_df.rename(columns={
+            "spec_id": "规格编号",
+            "spec_code": "规格编码",
+            "spec_desc": "规格描述",
+            "product_name": "产品名称",
+            "product_code": "产品编码",
+            "variant_count": "工艺/材质变体数",
+            "lot_count": "Lot数量",
+            "available_qty": "可用数量",
+            "reserved_qty": "预留数量",
+            "total_qty": "总数量"
+        }), hide_index=True)
+
+    with tab_variant:
+        st.markdown("### 规格 + 特殊工艺 + 材质库存池")
+
+        if filtered_group_df.empty:
+            st.info("当前筛选条件下没有规格化库存。")
+        else:
+            show_df(filtered_group_df.rename(columns={
+                "spec_id": "规格编号",
+                "spec_code": "规格编码",
+                "spec_desc": "规格描述",
+                "product_name": "产品名称",
+                "product_code": "产品编码",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "variant_label": "工艺 / 材质",
+                "spec_stock_group_key": "规格化库存Key",
+                "lot_count": "Lot数量",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "total_qty": "总数量",
+                "latest_out_time": "最近出库时间"
+            }), hide_index=True)
+
+            selected_group_key = st.selectbox(
+                "选择一个规格化库存池查看 Lot 明细",
+                filtered_group_df["spec_stock_group_key"].tolist(),
+                format_func=lambda x: (
+                    f"{filtered_group_df.loc[filtered_group_df['spec_stock_group_key'] == x, 'spec_code'].iloc[0]}"
+                    f"｜{filtered_group_df.loc[filtered_group_df['spec_stock_group_key'] == x, 'special_process'].iloc[0]}"
+                    f"｜{filtered_group_df.loc[filtered_group_df['spec_stock_group_key'] == x, 'material'].iloc[0]}"
+                    f"｜可用 {float(filtered_group_df.loc[filtered_group_df['spec_stock_group_key'] == x, 'available_qty'].iloc[0] or 0):.0f}"
+                ),
+                key=f"{section_key_prefix}_selected_group_key"
+            )
+
+            selected_group_detail_df = filtered_detail_df[
+                filtered_detail_df["spec_stock_group_key"] == selected_group_key
+            ].copy()
+
+            st.markdown("#### 当前库存池 Lot 明细")
+            show_df(selected_group_detail_df[[
+                "inventory_lot_id",
+                "lot_code",
+                "spec_code",
+                "special_process",
+                "material",
+                "available_qty",
+                "reserved_qty",
+                "lot_total_qty",
+                "lot_status",
+                "release_status",
+                "location",
+                "batch_code",
+                "po_no",
+                "customer_name",
+                "trace_key"
+            ]].rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "spec_code": "规格编码",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "lot_total_qty": "总数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "location": "库位",
+                "batch_code": "来源生产批次",
+                "po_no": "来源PO",
+                "customer_name": "来源客户",
+                "trace_key": "Trace Key"
+            }), hide_index=True)
+
+    with tab_lot:
+        st.markdown("### 规格化库存 Lot 明细")
+
+        if filtered_detail_df.empty:
+            st.info("当前筛选条件下没有 Lot 明细。")
+        else:
+            show_df(filtered_detail_df[[
+                "inventory_lot_id",
+                "lot_code",
+                "spec_stock_group_key",
+                "product_name",
+                "spec_code",
+                "spec_desc",
+                "special_process",
+                "material",
+                "available_qty",
+                "reserved_qty",
+                "lot_total_qty",
+                "lot_status",
+                "release_status",
+                "location",
+                "production_batch_id",
+                "batch_code",
+                "po_no",
+                "customer_name",
+                "trace_key"
+            ]].rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "spec_stock_group_key": "规格化库存Key",
+                "product_name": "产品名称",
+                "spec_code": "规格编码",
+                "spec_desc": "规格描述",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "lot_total_qty": "总数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "location": "库位",
+                "production_batch_id": "来源生产批次编号",
+                "batch_code": "来源生产批号",
+                "po_no": "来源PO",
+                "customer_name": "来源客户",
+                "trace_key": "Trace Key"
+            }), hide_index=True)
+
+
 
 # =========================
 # 规格化库存调整：非买卖原因增减库存
@@ -14462,6 +15421,148 @@ def sync_qc_qty_to_batch_and_delivery(conn, production_batch_id):
         sync_after_delivery_plan_change(conn, int(batch["delivery_plan_id"]))
 
     return True, f"已同步质检数量：当前待入库数量 {float(final_qty):.0f}"
+
+
+def get_final_inbound_ready_qty(conn, production_batch_id):
+    """
+    仓储正式入库数量来源。
+
+    优先级：
+    1. End Inspection / 端检 的 output_qty
+    2. production_measurement.qc_after_qty
+    3. production_batch.semi_finished_wh_qty
+    4. production_batch.actual_qty
+
+    正常情况下，正式入库数量应等于端检后数量。
+    """
+
+    end_df = pd.read_sql_query("""
+        SELECT
+            output_qty
+        FROM production_process_log
+        WHERE production_batch_id = ?
+          AND process_step = 'End Inspection'
+          AND process_status = 'done'
+        ORDER BY process_log_id DESC
+        LIMIT 1
+    """, conn, params=[int(production_batch_id)])
+
+    if not end_df.empty:
+        return float(end_df.iloc[0]["output_qty"] or 0)
+
+    qty_df = pd.read_sql_query("""
+        SELECT
+            COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
+            COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+            COALESCE(pb.actual_qty, 0) AS actual_qty
+        FROM production_batch pb
+        LEFT JOIN production_measurement pm
+            ON pb.production_batch_id = pm.production_batch_id
+        WHERE pb.production_batch_id = ?
+    """, conn, params=[int(production_batch_id)])
+
+    if qty_df.empty:
+        return 0.0
+
+    row = qty_df.iloc[0]
+
+    if float(row["qc_after_qty"] or 0) > 0:
+        return float(row["qc_after_qty"] or 0)
+
+    if float(row["semi_finished_wh_qty"] or 0) > 0:
+        return float(row["semi_finished_wh_qty"] or 0)
+
+    return float(row["actual_qty"] or 0)
+
+
+def insert_inventory_lot_safely(
+    conn,
+    lot_code,
+    production_batch_id,
+    product_id,
+    spec_id,
+    trace_key,
+    location,
+    available_qty,
+    release_status="released",
+    lot_status="available",
+    exclusive_customer="",
+    forbidden_customer=""
+):
+    """
+    安全插入 inventory_lot。
+    会根据当前数据库实际字段动态插入，避免旧库字段不一致报错。
+    """
+
+    cursor = conn.cursor()
+    cols = pd.read_sql_query("PRAGMA table_info(inventory_lot)", conn)["name"].tolist()
+
+    data = {
+        "lot_code": lot_code,
+        "production_batch_id": int(production_batch_id),
+        "product_id": int(product_id) if pd.notna(product_id) else None,
+        "spec_id": int(spec_id) if pd.notna(spec_id) else None,
+        "trace_key": trace_key,
+        "location": location,
+        "available_qty": float(available_qty),
+        "reserved_qty": 0,
+        "lot_status": lot_status,
+        "release_status": release_status,
+        "exclusive_customer": exclusive_customer,
+        "forbidden_customer": forbidden_customer,
+    }
+
+    insert_cols = [c for c in data.keys() if c in cols]
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    col_sql = ", ".join(insert_cols)
+
+    cursor.execute(
+        f"""
+        INSERT INTO inventory_lot ({col_sql})
+        VALUES ({placeholders})
+        """,
+        [data[c] for c in insert_cols]
+    )
+
+    return cursor.lastrowid
+
+
+def insert_inventory_txn_safely(
+    conn,
+    inventory_lot_id,
+    txn_type,
+    qty,
+    txn_reason,
+    reference_no
+):
+    """
+    安全写入 inventory_transaction_log。
+    """
+
+    cursor = conn.cursor()
+    cols = pd.read_sql_query("PRAGMA table_info(inventory_transaction_log)", conn)["name"].tolist()
+
+    data = {
+        "inventory_lot_id": int(inventory_lot_id),
+        "txn_type": txn_type,
+        "qty": float(qty),
+        "txn_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "txn_reason": txn_reason,
+        "reference_no": reference_no,
+    }
+
+    insert_cols = [c for c in data.keys() if c in cols]
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    col_sql = ", ".join(insert_cols)
+
+    cursor.execute(
+        f"""
+        INSERT INTO inventory_transaction_log ({col_sql})
+        VALUES ({placeholders})
+        """,
+        [data[c] for c in insert_cols]
+    )
+
 
 # =========================
 # 半成品仓库看板
@@ -17626,6 +18727,7 @@ def main():
         "库存/仓储": [
             "仓储总看板",
             "库存",
+            "退货再上架",
         ],
         "出货追踪": [
              "出货追踪中心",
@@ -17760,6 +18862,9 @@ def main():
 
     elif page == "库存":
         page_inventory_lot(conn)
+
+    elif page == "退货再上架":
+        page_return_restock_to_spec_inventory(conn)
 
     elif page == "出货追踪中心":
         page_outbound_tracking_center(conn)
