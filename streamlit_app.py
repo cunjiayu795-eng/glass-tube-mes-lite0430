@@ -5584,321 +5584,1184 @@ def render_sales_to_production_push(conn):
             else:
                 st.error(msg)
 
-def page_realtime_control_tower(conn):
-    st.header("联动｜实时联动看板")
 
-    # =========================
-    # 1. 按交付批次取未完成数据
-    # =========================
-    dp_df = pd.read_sql_query("""
-        WITH batch_status AS (
+def repair_realtime_sync_anomalies(conn):
+    """
+    修复实时联动看板中常见的历史数据同步异常。
+
+    修复规则：
+    1. 质检中：
+       qc_before_qty 应等于 Semi Finished Warehouse 工序产出。
+
+    2. 待入库确认：
+       semi_finished_wh_qty / actual_qty 应等于端检后数量 qc_after_qty。
+
+    3. 已入库：
+       semi_finished_wh_qty 必须清零；
+       finished_wh_qty 应等于端检后数量或库存 Lot 数量。
+
+    4. 已出货 / 部分出货：
+       delivery_plan.actual_delivery_qty 应等于 shipment_item 汇总。
+    """
+
+    cur = conn.cursor()
+    repaired = []
+
+    try:
+        # =========================
+        # 1. 修复质检中：质检前数量 = 半成品仓产出
+        # =========================
+        qc_df = pd.read_sql_query("""
+            SELECT
+                pb.production_batch_id,
+                pb.batch_code,
+                ps.delivery_plan_id,
+                dp.delivery_status,
+                pm.measurement_id,
+                COALESCE(pm.qc_before_qty, 0) AS qc_before_qty,
+                COALESCE(sf.output_qty, 0) AS semi_finished_output_qty
+            FROM production_batch pb
+            JOIN production_schedule ps
+                ON pb.production_batch_id = ps.production_batch_id
+            JOIN delivery_plan dp
+                ON ps.delivery_plan_id = dp.delivery_plan_id
+            LEFT JOIN production_measurement pm
+                ON pb.production_batch_id = pm.production_batch_id
+            LEFT JOIN (
+                SELECT
+                    production_batch_id,
+                    output_qty
+                FROM production_process_log
+                WHERE process_step = 'Semi Finished Warehouse'
+                  AND process_status = 'done'
+                GROUP BY production_batch_id
+                HAVING MAX(process_log_id)
+            ) sf
+                ON pb.production_batch_id = sf.production_batch_id
+            WHERE dp.delivery_status = '质检中'
+              AND COALESCE(sf.output_qty, 0) > 0
+              AND ABS(COALESCE(pm.qc_before_qty, 0) - COALESCE(sf.output_qty, 0)) > 0.000001
+        """, conn)
+
+        for _, row in qc_df.iterrows():
+            batch_id = int(row["production_batch_id"])
+            semi_qty = float(row["semi_finished_output_qty"] or 0)
+
+            cur.execute("""
+                UPDATE production_batch
+                SET actual_qty = ?,
+                    semi_finished_wh_qty = ?,
+                    production_flow_status = '质检中'
+                WHERE production_batch_id = ?
+            """, (
+                semi_qty,
+                semi_qty,
+                batch_id
+            ))
+
+            if pd.isna(row["measurement_id"]):
+                cur.execute("""
+                    INSERT INTO production_measurement (
+                        production_batch_id,
+                        quality_status,
+                        release_status,
+                        inspected_at,
+                        release_by,
+                        qc_before_qty,
+                        qc_after_qty,
+                        qc_loss_qty,
+                        qc_note
+                    ) VALUES (?, 'Pending', 'pending', datetime('now'), 'Auto Repair', ?, 0, 0, ?)
+                """, (
+                    batch_id,
+                    semi_qty,
+                    "历史数据修复：质检前数量同步为 Semi Finished Warehouse 产出"
+                ))
+            else:
+                cur.execute("""
+                    UPDATE production_measurement
+                    SET qc_before_qty = ?,
+                        qc_note = COALESCE(qc_note, '') || '；历史数据修复：质检前数量同步为半成品仓产出'
+                    WHERE production_batch_id = ?
+                """, (
+                    semi_qty,
+                    batch_id
+                ))
+
+            repaired.append(f"批次 {row['batch_code']}：质检前数量同步为 {semi_qty:.0f}")
+
+        # =========================
+        # 2. 修复待入库确认：待入库数量 = 端检后数量
+        # =========================
+        wait_df = pd.read_sql_query("""
+            SELECT
+                pb.production_batch_id,
+                pb.batch_code,
+                ps.delivery_plan_id,
+                dp.delivery_status,
+                COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
+                COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty
+            FROM production_batch pb
+            JOIN production_schedule ps
+                ON pb.production_batch_id = ps.production_batch_id
+            JOIN delivery_plan dp
+                ON ps.delivery_plan_id = dp.delivery_plan_id
+            LEFT JOIN production_measurement pm
+                ON pb.production_batch_id = pm.production_batch_id
+            WHERE dp.delivery_status = '待入库确认'
+              AND COALESCE(pm.qc_after_qty, 0) > 0
+              AND ABS(COALESCE(pb.semi_finished_wh_qty, 0) - COALESCE(pm.qc_after_qty, 0)) > 0.000001
+        """, conn)
+
+        for _, row in wait_df.iterrows():
+            batch_id = int(row["production_batch_id"])
+            qc_after_qty = float(row["qc_after_qty"] or 0)
+
+            cur.execute("""
+                UPDATE production_batch
+                SET actual_qty = ?,
+                    semi_finished_wh_qty = ?,
+                    production_flow_status = '待入库确认'
+                WHERE production_batch_id = ?
+            """, (
+                qc_after_qty,
+                qc_after_qty,
+                batch_id
+            ))
+
+            repaired.append(f"批次 {row['batch_code']}：待入库数量同步为端检后数量 {qc_after_qty:.0f}")
+
+        # =========================
+        # 3. 修复已入库：半成品清零，成品仓数量同步
+        # =========================
+        inbound_df = pd.read_sql_query("""
+            SELECT
+                pb.production_batch_id,
+                pb.batch_code,
+                ps.delivery_plan_id,
+                dp.delivery_status,
+                COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+                COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
+                COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
+                COALESCE(inv.inventory_total_qty, 0) AS inventory_total_qty
+            FROM production_batch pb
+            JOIN production_schedule ps
+                ON pb.production_batch_id = ps.production_batch_id
+            JOIN delivery_plan dp
+                ON ps.delivery_plan_id = dp.delivery_plan_id
+            LEFT JOIN production_measurement pm
+                ON pb.production_batch_id = pm.production_batch_id
+            LEFT JOIN (
+                SELECT
+                    production_batch_id,
+                    SUM(COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0)) AS inventory_total_qty
+                FROM inventory_lot
+                GROUP BY production_batch_id
+            ) inv
+                ON pb.production_batch_id = inv.production_batch_id
+            WHERE dp.delivery_status = '已入库'
+              AND COALESCE(pb.semi_finished_wh_qty, 0) > 0
+        """, conn)
+
+        for _, row in inbound_df.iterrows():
+            batch_id = int(row["production_batch_id"])
+
+            finished_qty = float(row["qc_after_qty"] or 0)
+            if finished_qty <= 0:
+                finished_qty = float(row["inventory_total_qty"] or 0)
+            if finished_qty <= 0:
+                finished_qty = float(row["finished_wh_qty"] or 0)
+
+            cur.execute("""
+                UPDATE production_batch
+                SET semi_finished_wh_qty = 0,
+                    finished_wh_qty = ?,
+                    actual_qty = ?,
+                    production_flow_status = '已入库'
+                WHERE production_batch_id = ?
+            """, (
+                finished_qty,
+                finished_qty,
+                batch_id
+            ))
+
+            repaired.append(f"批次 {row['batch_code']}：已入库批次半成品数量清零，成品数量同步为 {finished_qty:.0f}")
+
+        # =========================
+        # 4. 修复出货数量：delivery_plan.actual_delivery_qty = shipment_item 汇总
+        # =========================
+        shipment_df = pd.read_sql_query("""
             SELECT
                 dp.delivery_plan_id,
-                CASE
-                    WHEN MAX(CASE WHEN il.inventory_lot_id IS NOT NULL
-                                   AND lower(COALESCE(il.release_status, 'pending')) = 'released'
-                                  THEN 1 ELSE 0 END) = 1 THEN '已入库'
-                    WHEN MAX(CASE WHEN pm.measurement_id IS NOT NULL THEN 1 ELSE 0 END) = 1 THEN '质检'
-                    WHEN MAX(CASE WHEN ppl.process_step = 'Cleaning' THEN 1 ELSE 0 END) = 1 THEN '清洗'
-                    WHEN MAX(CASE WHEN ppl.process_step = 'Cutting' THEN 1 ELSE 0 END) = 1 THEN '切割'
-                    WHEN MAX(CASE WHEN ps.production_schedule_id IS NOT NULL THEN 1 ELSE 0 END) = 1 THEN '已排产'
-                    ELSE COALESCE(MAX(dp.delivery_status), '未排产')
-                END AS real_process_status
+                dp.order_item_id,
+                COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
+                COALESCE(ship.shipped_qty, 0) AS shipped_qty
             FROM delivery_plan dp
-            LEFT JOIN production_schedule ps ON dp.delivery_plan_id = ps.delivery_plan_id
-            LEFT JOIN production_batch pb ON ps.production_batch_id = pb.production_batch_id
-            LEFT JOIN production_process_log ppl ON pb.production_batch_id = ppl.production_batch_id
-            LEFT JOIN production_measurement pm ON pb.production_batch_id = pm.production_batch_id
-            LEFT JOIN inventory_lot il ON pb.production_batch_id = il.production_batch_id
-            GROUP BY dp.delivery_plan_id
-        ),
-        inv_sum AS (
-            SELECT
-                spec_id,
-                COALESCE(SUM(CASE
-                    WHEN lower(COALESCE(release_status, 'pending')) = 'released'
-                     AND lower(COALESCE(lot_status, 'hold')) IN ('available', 'reserved')
-                    THEN COALESCE(available_qty, 0)
-                    ELSE 0
-                END), 0) AS shippable_stock_qty,
-                COALESCE(SUM(CASE
-                    WHEN location = 'WH-ORDER'
-                    THEN COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0)
-                    ELSE 0
-                END), 0) AS order_stock_qty,
-                COALESCE(SUM(CASE
-                    WHEN location = 'WH-SPEC'
-                    THEN COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0)
-                    ELSE 0
-                END), 0) AS spec_stock_qty
-            FROM inventory_lot
-            GROUP BY spec_id
-        )
-        SELECT
-            dp.delivery_plan_id,
-            dp.order_item_id,
-            dp.delivery_batch_no,
-            dp.planned_delivery_date,
-            dp.planned_delivery_qty,
-            COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
-            (dp.planned_delivery_qty - COALESCE(dp.actual_delivery_qty, 0)) AS undelivered_batch_qty,
-            COALESCE(bs.real_process_status, dp.delivery_status, '未排产') AS delivery_status,
+            LEFT JOIN (
+                SELECT
+                    si.order_item_id,
+                    SUM(COALESCE(si.shipped_qty, 0)) AS shipped_qty
+                FROM shipment_item si
+                GROUP BY si.order_item_id
+            ) ship
+                ON dp.order_item_id = ship.order_item_id
+            WHERE COALESCE(ship.shipped_qty, 0) > 0
+              AND ABS(COALESCE(dp.actual_delivery_qty, 0) - COALESCE(ship.shipped_qty, 0)) > 0.000001
+        """, conn)
 
+        for _, row in shipment_df.iterrows():
+            dp_id = int(row["delivery_plan_id"])
+            shipped_qty = float(row["shipped_qty"] or 0)
+
+            cur.execute("""
+                UPDATE delivery_plan
+                SET actual_delivery_qty = ?,
+                    delivery_status = CASE
+                        WHEN ? >= COALESCE(planned_delivery_qty, 0) THEN '已出货'
+                        WHEN ? > 0 THEN '部分出货'
+                        ELSE delivery_status
+                    END
+                WHERE delivery_plan_id = ?
+            """, (
+                shipped_qty,
+                shipped_qty,
+                shipped_qty,
+                dp_id
+            ))
+
+            repaired.append(f"交付批次 {dp_id}：实际出货数量同步为出货明细合计 {shipped_qty:.0f}")
+
+        conn.commit()
+
+        # =========================
+        # 5. 全局同步所有交付批次
+        # =========================
+        if "sync_after_delivery_plan_change" in globals():
+            dp_df = pd.read_sql_query("""
+                SELECT DISTINCT delivery_plan_id
+                FROM delivery_plan
+                WHERE delivery_plan_id IS NOT NULL
+            """, conn)
+
+            for dp_id in dp_df["delivery_plan_id"].dropna().astype(int).tolist():
+                try:
+                    sync_after_delivery_plan_change(conn, int(dp_id))
+                except Exception:
+                    pass
+
+        if not repaired:
+            return True, "没有发现需要自动修复的历史同步异常。"
+
+        return True, "已完成历史数据修复：\n" + "\n".join(repaired)
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"历史数据修复失败：{e}"
+
+
+def page_realtime_control_tower(conn):
+    st.header("实时联动看板｜订单 → 生产 → 半成品 → 入库 → 出货")
+
+    st.info(
+        "本页面用于集中核对销售、生产、半成品仓、仓储、库存、出货之间的数据是否同步。"
+        "建议每次完成生产、质检、入库、出货或退货再上架后，到这里检查一次。"
+    )
+
+    if "ensure_semi_finished_warehouse_schema" in globals():
+        ensure_semi_finished_warehouse_schema(conn)
+
+    # =========================
+    # 1. 主联动查询
+    # =========================
+    control_df = pd.read_sql_query("""
+        WITH process_summary AS (
+            SELECT
+                production_batch_id,
+                MAX(process_log_id) AS latest_process_log_id,
+                COUNT(*) AS process_log_count,
+                SUM(COALESCE(input_qty, 0)) AS total_process_input_qty,
+                SUM(COALESCE(output_qty, 0)) AS total_process_output_qty,
+                SUM(COALESCE(scrap_qty, 0)) AS total_process_scrap_qty,
+                MAX(CASE
+                    WHEN process_step = 'Semi Finished Warehouse'
+                     AND process_status = 'done'
+                    THEN output_qty ELSE NULL END
+                ) AS semi_finished_process_output_qty,
+                MAX(CASE
+                    WHEN process_step = 'Column Inspection'
+                     AND process_status = 'done'
+                    THEN output_qty ELSE NULL END
+                ) AS column_inspection_output_qty,
+                MAX(CASE
+                    WHEN process_step = 'End Inspection'
+                     AND process_status = 'done'
+                    THEN output_qty ELSE NULL END
+                ) AS end_inspection_output_qty,
+                MAX(CASE
+                    WHEN process_step = 'Column Inspection'
+                     AND process_status = 'done'
+                    THEN 1 ELSE 0 END
+                ) AS column_done,
+                MAX(CASE
+                    WHEN process_step = 'End Inspection'
+                     AND process_status = 'done'
+                    THEN 1 ELSE 0 END
+                ) AS end_done
+            FROM production_process_log
+            GROUP BY production_batch_id
+        ),
+
+        latest_process AS (
+            SELECT
+                ppl.production_batch_id,
+                ppl.process_step AS latest_process_step,
+                ppl.process_status AS latest_process_status,
+                ppl.input_qty AS latest_input_qty,
+                ppl.output_qty AS latest_output_qty,
+                ppl.scrap_qty AS latest_scrap_qty,
+                ppl.end_time AS latest_process_time
+            FROM production_process_log ppl
+            JOIN process_summary ps
+                ON ppl.production_batch_id = ps.production_batch_id
+               AND ppl.process_log_id = ps.latest_process_log_id
+        ),
+
+        inventory_summary AS (
+            SELECT
+                production_batch_id,
+                COUNT(DISTINCT inventory_lot_id) AS lot_count,
+                SUM(COALESCE(available_qty, 0)) AS inventory_available_qty,
+                SUM(COALESCE(reserved_qty, 0)) AS inventory_reserved_qty,
+                SUM(COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0)) AS inventory_total_qty,
+                SUM(CASE WHEN location = 'WH-ORDER'
+                         THEN COALESCE(available_qty, 0) ELSE 0 END) AS wh_order_qty,
+                SUM(CASE WHEN location = 'WH-SPEC'
+                         THEN COALESCE(available_qty, 0) ELSE 0 END) AS wh_spec_qty
+            FROM inventory_lot
+            GROUP BY production_batch_id
+        ),
+
+        shipment_summary AS (
+            SELECT
+                si.order_item_id,
+                COUNT(DISTINCT s.shipment_id) AS shipment_count,
+                SUM(COALESCE(si.shipped_qty, 0)) AS shipment_item_total_qty,
+                MAX(s.ship_date) AS latest_ship_date,
+                MAX(s.shipment_no) AS latest_shipment_no
+            FROM shipment_item si
+            LEFT JOIN shipment s
+                ON si.shipment_id = s.shipment_id
+            GROUP BY si.order_item_id
+        )
+
+        SELECT
+            o.order_id,
+            o.order_status,
+            c.customer_name,
+
+            oi.order_item_id,
             oi.po_no,
             oi.customer_pn,
             oi.product_spec_text,
+            COALESCE(pspec.spec_code, oi.product_spec_text) AS spec_code,
+            COALESCE(oi.special_process, 'STANDARD') AS special_process,
+            COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
             oi.trace_key,
-            oi.spec_id,
-            oi.ordered_qty,
-            oi.shipped_qty,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.fulfilled_qty, 0) AS fulfilled_qty,
+            COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
+            COALESCE(oi.item_status, '') AS item_status,
 
-            c.customer_name,
-            o.customer_id,
+            dp.delivery_plan_id,
+            COALESCE(dp.delivery_batch_no, 1) AS delivery_batch_no,
+            dp.planned_delivery_date,
+            COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
+            COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
+            COALESCE(dp.delivery_status, '未排产') AS delivery_status,
 
-            ps.production_schedule_id,
-            ps.production_batch_id,
+            pb.production_batch_id,
             pb.batch_code,
-            pb.required_production_qty,
-            pb.actual_qty,
-            pb.production_flow_status,
-            pm.quality_status,
-            pm.release_status,
+            COALESCE(pb.required_production_qty, 0) AS required_production_qty,
+            COALESCE(pb.actual_qty, 0) AS batch_actual_qty,
+            COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+            COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
+            COALESCE(pb.production_flow_status, '') AS production_flow_status,
+            COALESCE(pb.special_process, oi.special_process, 'STANDARD') AS batch_special_process,
+            COALESCE(pb.material, oi.material, 'UNKNOWN_MATERIAL') AS batch_material,
 
-            COALESCE(inv.order_stock_qty, 0) AS order_stock_qty,
-            COALESCE(inv.spec_stock_qty, 0) AS spec_stock_qty,
-            COALESCE(inv.shippable_stock_qty, 0) AS shippable_stock_qty
-        FROM delivery_plan dp
-        JOIN order_item oi ON dp.order_item_id = oi.order_item_id
-        JOIN orders o ON oi.order_id = o.order_id
-        JOIN customer c ON o.customer_id = c.customer_id
-        LEFT JOIN production_schedule ps ON dp.delivery_plan_id = ps.delivery_plan_id
-        LEFT JOIN production_batch pb ON ps.production_batch_id = pb.production_batch_id
-        LEFT JOIN production_measurement pm ON pb.production_batch_id = pm.production_batch_id
-        LEFT JOIN batch_status bs ON dp.delivery_plan_id = bs.delivery_plan_id
-        LEFT JOIN inv_sum inv ON oi.spec_id = inv.spec_id
-        WHERE (dp.planned_delivery_qty - COALESCE(dp.actual_delivery_qty, 0)) > 0
-        ORDER BY oi.order_item_id, dp.delivery_batch_no, dp.planned_delivery_date
+            COALESCE(pm.quality_status, 'Pending') AS quality_status,
+            COALESCE(pm.release_status, 'pending') AS release_status,
+            COALESCE(pm.qc_before_qty, 0) AS qc_before_qty,
+            COALESCE(pm.qc_after_qty, 0) AS qc_after_qty,
+            COALESCE(pm.qc_loss_qty, 0) AS qc_loss_qty,
+            pm.inspected_at,
+            pm.release_by,
+
+            COALESCE(proc.process_log_count, 0) AS process_log_count,
+            COALESCE(proc.total_process_input_qty, 0) AS total_process_input_qty,
+            COALESCE(proc.total_process_output_qty, 0) AS total_process_output_qty,
+            COALESCE(proc.total_process_scrap_qty, 0) AS total_process_scrap_qty,
+            COALESCE(proc.semi_finished_process_output_qty, 0) AS semi_finished_process_output_qty,
+            COALESCE(proc.column_inspection_output_qty, 0) AS column_inspection_output_qty,
+            COALESCE(proc.end_inspection_output_qty, 0) AS end_inspection_output_qty,
+            COALESCE(proc.column_done, 0) AS column_done,
+            COALESCE(proc.end_done, 0) AS end_done,
+
+            lp.latest_process_step,
+            lp.latest_process_status,
+            lp.latest_input_qty,
+            lp.latest_output_qty,
+            lp.latest_scrap_qty,
+            lp.latest_process_time,
+
+            COALESCE(inv.lot_count, 0) AS lot_count,
+            COALESCE(inv.inventory_available_qty, 0) AS inventory_available_qty,
+            COALESCE(inv.inventory_reserved_qty, 0) AS inventory_reserved_qty,
+            COALESCE(inv.inventory_total_qty, 0) AS inventory_total_qty,
+            COALESCE(inv.wh_order_qty, 0) AS wh_order_qty,
+            COALESCE(inv.wh_spec_qty, 0) AS wh_spec_qty,
+
+            COALESCE(ship.shipment_count, 0) AS shipment_count,
+            COALESCE(ship.shipment_item_total_qty, 0) AS shipment_item_total_qty,
+            ship.latest_ship_date,
+            ship.latest_shipment_no
+
+        FROM order_item oi
+        JOIN orders o
+            ON oi.order_id = o.order_id
+        JOIN customer c
+            ON o.customer_id = c.customer_id
+        LEFT JOIN product_spec pspec
+            ON oi.spec_id = pspec.spec_id
+        LEFT JOIN delivery_plan dp
+            ON oi.order_item_id = dp.order_item_id
+        LEFT JOIN production_schedule sch
+            ON dp.delivery_plan_id = sch.delivery_plan_id
+        LEFT JOIN production_batch pb
+            ON sch.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_measurement pm
+            ON pb.production_batch_id = pm.production_batch_id
+        LEFT JOIN process_summary proc
+            ON pb.production_batch_id = proc.production_batch_id
+        LEFT JOIN latest_process lp
+            ON pb.production_batch_id = lp.production_batch_id
+        LEFT JOIN inventory_summary inv
+            ON pb.production_batch_id = inv.production_batch_id
+        LEFT JOIN shipment_summary ship
+            ON oi.order_item_id = ship.order_item_id
+
+        ORDER BY
+            o.order_id DESC,
+            oi.order_item_id DESC,
+            dp.delivery_batch_no,
+            dp.delivery_plan_id
     """, conn)
 
-    if dp_df.empty:
-        st.success("当前没有未完成的交付批次。")
+    if control_df.empty:
+        st.info("当前没有可展示的订单 / 交付 / 生产联动数据。")
         return
 
-    # =========================
-    # 2. 顶部总览
-    # =========================
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("未完成交付批次数", int(len(dp_df)))
-    k2.metric("未完成交付总量", f"{float(dp_df['undelivered_batch_qty'].sum()):.0f}")
-    k3.metric("可出货库存总量", f"{float(dp_df['shippable_stock_qty'].max() if len(dp_df) > 0 else 0):.0f}")
-    k4.metric("已排产批次数", int((dp_df["delivery_status"] != "未排产").sum()))
-
-    st.markdown("---")
+    control_df = control_df.copy()
 
     # =========================
-    # 3. 分批总表
+    # 2. 衍生字段
     # =========================
-    st.subheader("批次级联动总表")
+    numeric_cols = [
+        "ordered_qty",
+        "fulfilled_qty",
+        "order_item_shipped_qty",
+        "planned_delivery_qty",
+        "actual_delivery_qty",
+        "required_production_qty",
+        "batch_actual_qty",
+        "semi_finished_wh_qty",
+        "finished_wh_qty",
+        "qc_before_qty",
+        "qc_after_qty",
+        "qc_loss_qty",
+        "semi_finished_process_output_qty",
+        "column_inspection_output_qty",
+        "end_inspection_output_qty",
+        "inventory_available_qty",
+        "inventory_total_qty",
+        "shipment_item_total_qty",
+    ]
 
-    dp_display_df = dp_df.rename(columns={
-        "delivery_batch_no": "交付批次",
-        "planned_delivery_date": "计划交付日期",
-        "planned_delivery_qty": "计划交付数量",
-        "actual_delivery_qty": "实际交付数量",
-        "undelivered_batch_qty": "该批未交付量",
-        "delivery_status": "交付状态",
-        "batch_code": "对应批次号",
-        "required_production_qty": "应生产数量",
-        "actual_qty": "实际生产数量",
-        "production_flow_status": "生产状态",
-        "order_stock_qty": "订单库存",
-        "spec_stock_qty": "规格库存",
-        "shippable_stock_qty": "可出货库存"
-    })
-    show_df(dp_display_df, hide_index=True)
+    for col in numeric_cols:
+        if col in control_df.columns:
+            control_df[col] = pd.to_numeric(control_df[col], errors="coerce").fillna(0)
 
-    st.markdown("---")
+    control_df["remaining_delivery_qty"] = (
+        control_df["planned_delivery_qty"] - control_df["actual_delivery_qty"]
+    ).clip(lower=0)
 
-    # =========================
-    # 4. 选择当前交付批次
-    # =========================
-    selected_delivery_plan_id = st.selectbox(
-        "选择一条交付批次进行联动查看与处理",
-        dp_df["delivery_plan_id"].tolist(),
-        format_func=lambda x: (
-            f"{x} | "
-            f"{dp_df.loc[dp_df['delivery_plan_id'] == x, 'po_no'].iloc[0]} | "
-            f"第{int(dp_df.loc[dp_df['delivery_plan_id'] == x, 'delivery_batch_no'].iloc[0])}批 | "
-            f"{dp_df.loc[dp_df['delivery_plan_id'] == x, 'product_spec_text'].iloc[0]}"
+    control_df["delivery_progress_pct"] = control_df.apply(
+        lambda r: (
+            float(r["actual_delivery_qty"]) / float(r["planned_delivery_qty"]) * 100
+            if float(r["planned_delivery_qty"] or 0) > 0 else 0
         ),
-        key="tower_delivery_plan_select"
+        axis=1
     )
 
-    selected_row = dp_df[dp_df["delivery_plan_id"] == selected_delivery_plan_id].iloc[0]
-    current_status = get_delivery_plan_process_status(conn, int(selected_delivery_plan_id))
+    def _calc_qc_progress(row):
+        delivery_status = str(row.get("delivery_status", ""))
+        release_status = str(row.get("release_status", "")).lower()
+        column_done = int(row.get("column_done", 0) or 0)
+        end_done = int(row.get("end_done", 0) or 0)
 
-    # 当前交付批次相关 Lot
-    lots_df = pd.read_sql_query("""
-        SELECT
-            il.inventory_lot_id,
-            il.lot_code,
-            il.trace_key,
-            il.location,
-            il.available_qty,
-            il.reserved_qty,
-            il.release_status,
-            il.lot_status
-        FROM inventory_lot il
-        WHERE il.spec_id = ?
-          AND lower(COALESCE(il.release_status, 'pending')) = 'released'
-          AND lower(COALESCE(il.lot_status, 'hold')) IN ('available', 'reserved')
-          AND COALESCE(il.available_qty, 0) > 0
-        ORDER BY
-            CASE
-                WHEN il.location = 'WH-ORDER' THEN 1
-                WHEN il.location = 'WH-SPEC' THEN 2
-                ELSE 9
-            END,
-            il.available_qty DESC,
-            il.inventory_lot_id
-    """, conn, params=[int(selected_row["spec_id"])])
+        if delivery_status == "已入库":
+            return "已入库"
+        if delivery_status == "已出货":
+            return "已出货"
+        if delivery_status == "待入库确认":
+            return "待入库确认"
+        if end_done == 1 and release_status == "released":
+            return "端检完成 / 已放行"
+        if end_done == 1:
+            return "端检完成 / 未放行"
+        if column_done == 1:
+            return "柱检完成"
+        if delivery_status == "质检中":
+            return "未柱检"
+        return "未进入质检"
+
+    control_df["qc_progress"] = control_df.apply(_calc_qc_progress, axis=1)
+
+    def _calc_sync_flag(row):
+        issues = []
+
+        delivery_status = str(row.get("delivery_status", ""))
+        release_status = str(row.get("release_status", "")).lower()
+
+        semi_process_output = float(row.get("semi_finished_process_output_qty", 0) or 0)
+        semi_qty = float(row.get("semi_finished_wh_qty", 0) or 0)
+        qc_before = float(row.get("qc_before_qty", 0) or 0)
+        qc_after = float(row.get("qc_after_qty", 0) or 0)
+        end_output = float(row.get("end_inspection_output_qty", 0) or 0)
+        finished_qty = float(row.get("finished_wh_qty", 0) or 0)
+        inv_total = float(row.get("inventory_total_qty", 0) or 0)
+        actual_delivery = float(row.get("actual_delivery_qty", 0) or 0)
+        shipment_total = float(row.get("shipment_item_total_qty", 0) or 0)
+        item_shipped = float(row.get("order_item_shipped_qty", 0) or 0)
+
+        # 生产完成到质检前
+        if delivery_status == "质检中" and semi_process_output > 0:
+            if abs(qc_before - semi_process_output) > 0.000001:
+                issues.append("质检前数量未等于半成品仓产出")
+
+        # 端检后到待入库
+        if delivery_status == "待入库确认":
+            if release_status != "released":
+                issues.append("待入库但质检未 released")
+            if end_output > 0 and qc_after > 0 and abs(end_output - qc_after) > 0.000001:
+                issues.append("端检产出与质检后数量不一致")
+            if qc_after > 0 and abs(semi_qty - qc_after) > 0.000001:
+                issues.append("待入库数量未等于端检后数量")
+
+        # 已入库状态
+        if delivery_status == "已入库":
+            if semi_qty > 0:
+                issues.append("已入库但半成品数量未清零")
+            if qc_after > 0 and finished_qty > 0 and abs(finished_qty - qc_after) > 0.000001:
+                issues.append("成品仓数量未等于端检后数量")
+            if inv_total <= 0 and finished_qty > 0:
+                issues.append("已入库但库存 Lot 数量为 0")
+
+        # 出货状态
+        if actual_delivery > shipment_total + 0.000001:
+            issues.append("交付实际出货量大于出货明细合计")
+        if item_shipped + 0.000001 < shipment_total:
+            issues.append("订单明细 shipped_qty 小于出货明细合计")
+
+        if issues:
+            return "需检查：" + "；".join(issues)
+
+        return "同步正常"
+
+    control_df["sync_check"] = control_df.apply(_calc_sync_flag, axis=1)
+
+    abnormal_df = control_df[
+        control_df["sync_check"].astype(str) != "同步正常"
+    ].copy()
 
     # =========================
-    # 5. 销售 / 生产 / 库存 三联区
+    # 3. 顶部指标
     # =========================
-    col_sales, col_prod, col_inv = st.columns(3)
+    total_orders = int(control_df["order_id"].nunique())
+    total_items = int(control_df["order_item_id"].nunique())
+    total_delivery_plans = int(control_df["delivery_plan_id"].dropna().nunique())
+    abnormal_count = int(len(abnormal_df))
 
-    with col_sales:
-        st.markdown("### 销售区")
-        st.metric("客户", str(selected_row["customer_name"]))
-        st.metric("订单号", str(selected_row["po_no"]))
-        st.metric("交付批次", f"第 {int(selected_row['delivery_batch_no'])} 批")
-        st.metric("产品规格", str(selected_row["product_spec_text"]))
-        st.metric("计划交付数量", f"{float(selected_row['planned_delivery_qty']):.0f}")
-        st.metric("实际交付数量", f"{float(selected_row['actual_delivery_qty']):.0f}")
-        st.metric("该批未交付量", f"{float(selected_row['undelivered_batch_qty']):.0f}")
-        st.metric("交付状态", current_status)
+    total_planned = float(control_df["planned_delivery_qty"].sum())
+    total_actual_delivery = float(control_df["actual_delivery_qty"].sum())
+    total_inventory = float(control_df["inventory_total_qty"].sum())
+    total_shipment = float(control_df["shipment_item_total_qty"].sum())
 
-    with col_prod:
-        st.markdown("### 生产区")
-        if pd.isna(selected_row["production_batch_id"]):
-            st.info("当前批次尚未创建排产")
-        else:
-            st.metric("批次号", str(selected_row["batch_code"]))
-            st.metric("生产状态", str(selected_row["production_flow_status"]) if pd.notna(selected_row["production_flow_status"]) else "-")
-            st.metric("应生产数量", f"{float(selected_row['required_production_qty'] or 0):.0f}")
-            st.metric("实际生产数量", f"{float(selected_row['actual_qty'] or 0):.0f}")
-            st.metric("质量状态", str(selected_row["quality_status"]) if pd.notna(selected_row["quality_status"]) else "-")
-            st.metric("放行状态", str(selected_row["release_status"]) if pd.notna(selected_row["release_status"]) else "-")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("订单数", total_orders)
+    m2.metric("订单明细数", total_items)
+    m3.metric("交付批次数", total_delivery_plans)
+    m4.metric("需检查记录", abnormal_count)
 
-    with col_inv:
-        st.markdown("### 库存区")
-        st.metric("订单库存", f"{float(selected_row['order_stock_qty'] or 0):.0f}")
-        st.metric("规格库存", f"{float(selected_row['spec_stock_qty'] or 0):.0f}")
-        st.metric("可出货库存", f"{float(selected_row['shippable_stock_qty'] or 0):.0f}")
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("计划交付总量", f"{total_planned:.0f}")
+    m6.metric("实际出货总量", f"{total_actual_delivery:.0f}")
+    m7.metric("库存总量", f"{total_inventory:.0f}")
+    m8.metric("出货明细合计", f"{total_shipment:.0f}")
 
-        if lots_df.empty:
-            st.info("当前无可用 Lot")
-        else:
-            st.markdown("#### 当前规格可用 Lot")
-            show_df(lots_df, hide_index=True)
-
-    st.markdown("---")
-
-    # =========================
-    # 6. 实时操作区（按交付批次）
-    # =========================
-    st.markdown("## 实时操作区")
-    render_sales_process_flow(
-        current_status if current_status in ["未排产", "已排产", "切割", "清洗", "质检", "已入库"] else "未排产"
-    )
-
-    inventory_ready = float(selected_row["shippable_stock_qty"] or 0) >= float(selected_row["undelivered_batch_qty"] or 0)
-
-    if inventory_ready and current_status in ["已入库", "质检", "清洗", "切割", "已排产", "未排产"]:
-        st.success("当前库存满足该交付批次需求，可直接按该批次出货。")
-
-        if st.button("标记该交付批次已出货", key=f"tower_dp_ship_{selected_delivery_plan_id}"):
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE delivery_plan
-                SET delivery_status = '已出货',
-                    actual_delivery_date = COALESCE(actual_delivery_date, date('now')),
-                    actual_delivery_qty = COALESCE(actual_delivery_qty, planned_delivery_qty)
-                WHERE delivery_plan_id = ?
-            """, (int(selected_delivery_plan_id),))
-            conn.commit()
-            st.success("该交付批次已标记为已出货")
-            st.rerun()
-
+    if abnormal_count == 0:
+        st.success("当前联动检查未发现明显数量或状态异常。")
     else:
-        st.warning("当前库存不足该交付批次需求，需按该批次推进生产。")
-
-        if current_status == "未排产":
-            planned_qty_input = st.number_input(
-                "该交付批次应生产数量",
-                min_value=1.0,
-                value=float(selected_row["planned_delivery_qty"]),
-                step=1.0,
-                key=f"tower_dp_qty_{selected_delivery_plan_id}"
-            )
-            if st.button("为该交付批次创建排产", key=f"tower_dp_create_{selected_delivery_plan_id}"):
-                ok, msg = create_production_for_delivery_plan(
-                    conn,
-                    int(selected_delivery_plan_id),
-                    planned_qty=float(planned_qty_input)
-                )
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        elif current_status == "已排产":
-            if st.button("推进到切割", key=f"tower_dp_cutting_{selected_delivery_plan_id}"):
-                ok, msg = advance_delivery_plan_process_status(conn, int(selected_delivery_plan_id), "切割")
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        elif current_status == "切割":
-            if st.button("推进到清洗", key=f"tower_dp_cleaning_{selected_delivery_plan_id}"):
-                ok, msg = advance_delivery_plan_process_status(conn, int(selected_delivery_plan_id), "清洗")
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        elif current_status == "清洗":
-            if st.button("推进到质检", key=f"tower_dp_qc_{selected_delivery_plan_id}"):
-                ok, msg = advance_delivery_plan_process_status(conn, int(selected_delivery_plan_id), "质检")
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        elif current_status == "质检":
-            if st.button("标记已入库", key=f"tower_dp_inbound_{selected_delivery_plan_id}"):
-                ok, msg = mark_delivery_plan_as_inbound(conn, int(selected_delivery_plan_id))
-                if ok:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-        elif current_status == "已入库":
-            st.info("该交付批次已入库，等待库存满足或直接标记已出货。")
+        st.warning(f"当前发现 {abnormal_count} 条需要检查的联动记录，请查看【异常检查】Tab。")
 
     st.markdown("---")
 
     # =========================
-    # 7. 追踪明细区（订单级沿用）
+    # 4. 筛选区
     # =========================
-    render_current_order_trace_detail(conn, int(selected_row["order_item_id"]))
+    f1, f2, f3, f4 = st.columns(4)
+
+    with f1:
+        status_options = ["全部"] + sorted(
+            control_df["delivery_status"].dropna().astype(str).unique().tolist()
+        )
+        selected_delivery_status = st.selectbox(
+            "交付状态",
+            status_options,
+            key="control_tower_delivery_status_filter"
+        )
+
+    with f2:
+        qc_options = ["全部"] + sorted(
+            control_df["qc_progress"].dropna().astype(str).unique().tolist()
+        )
+        selected_qc_progress = st.selectbox(
+            "质检进度",
+            qc_options,
+            key="control_tower_qc_progress_filter"
+        )
+
+    with f3:
+        process_options = ["全部"] + sorted(
+            control_df["special_process"].dropna().astype(str).unique().tolist()
+        )
+        selected_process = st.selectbox(
+            "特殊工艺",
+            process_options,
+            key="control_tower_process_filter"
+        )
+
+    with f4:
+        material_options = ["全部"] + sorted(
+            control_df["material"].dropna().astype(str).unique().tolist()
+        )
+        selected_material = st.selectbox(
+            "材质",
+            material_options,
+            key="control_tower_material_filter"
+        )
+
+    search_text = st.text_input(
+        "快速搜索：客户 / PO / 批号 / Trace Key / 规格",
+        value="",
+        key="control_tower_search_text"
+    )
+
+    filtered_df = control_df.copy()
+
+    if selected_delivery_status != "全部":
+        filtered_df = filtered_df[
+            filtered_df["delivery_status"].astype(str) == selected_delivery_status
+        ].copy()
+
+    if selected_qc_progress != "全部":
+        filtered_df = filtered_df[
+            filtered_df["qc_progress"].astype(str) == selected_qc_progress
+        ].copy()
+
+    if selected_process != "全部":
+        filtered_df = filtered_df[
+            filtered_df["special_process"].astype(str) == selected_process
+        ].copy()
+
+    if selected_material != "全部":
+        filtered_df = filtered_df[
+            filtered_df["material"].astype(str) == selected_material
+        ].copy()
+
+    if search_text.strip():
+        s = search_text.strip().lower()
+        search_cols = [
+            "customer_name",
+            "po_no",
+            "batch_code",
+            "trace_key",
+            "spec_code",
+            "product_spec_text",
+        ]
+
+        mask = False
+        for col in search_cols:
+            if col in filtered_df.columns:
+                mask = mask | filtered_df[col].astype(str).str.lower().str.contains(s, na=False)
+
+        filtered_df = filtered_df[mask].copy()
+
+    # =========================
+    # 5. Tabs
+    # =========================
+    tab_overview, tab_detail, tab_flow, tab_abnormal, tab_sync = st.tabs([
+        "联动总览",
+        "订单/交付明细",
+        "全流程追踪",
+        "异常检查",
+        "手动同步"
+    ])
+
+    # =========================
+    # 5.1 联动总览
+    # =========================
+    with tab_overview:
+        st.subheader("联动总览")
+
+        if filtered_df.empty:
+            st.info("当前筛选条件下没有数据。")
+        else:
+            overview_cols = [
+                "sync_check",
+                "delivery_status",
+                "qc_progress",
+                "customer_name",
+                "po_no",
+                "delivery_batch_no",
+                "planned_delivery_date",
+                "planned_delivery_qty",
+                "actual_delivery_qty",
+                "remaining_delivery_qty",
+                "batch_code",
+                "production_flow_status",
+                "latest_process_step",
+                "semi_finished_wh_qty",
+                "qc_before_qty",
+                "qc_after_qty",
+                "finished_wh_qty",
+                "inventory_total_qty",
+                "shipment_item_total_qty",
+                "special_process",
+                "material",
+                "trace_key",
+            ]
+
+            existing_cols = [c for c in overview_cols if c in filtered_df.columns]
+
+            show_df(filtered_df[existing_cols].rename(columns={
+                "sync_check": "同步检查",
+                "delivery_status": "交付状态",
+                "qc_progress": "质检进度",
+                "customer_name": "客户",
+                "po_no": "PO",
+                "delivery_batch_no": "交付批次",
+                "planned_delivery_date": "计划交付日期",
+                "planned_delivery_qty": "计划交付数量",
+                "actual_delivery_qty": "实际出货数量",
+                "remaining_delivery_qty": "剩余出货数量",
+                "batch_code": "生产批号",
+                "production_flow_status": "生产状态",
+                "latest_process_step": "最新工序",
+                "semi_finished_wh_qty": "半成品数量",
+                "qc_before_qty": "质检前数量",
+                "qc_after_qty": "质检后数量",
+                "finished_wh_qty": "成品仓数量",
+                "inventory_total_qty": "库存Lot数量",
+                "shipment_item_total_qty": "出货明细数量",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "trace_key": "Trace Key"
+            }), hide_index=True)
+
+    # =========================
+    # 5.2 订单 / 交付明细
+    # =========================
+    with tab_detail:
+        st.subheader("订单 / 交付明细")
+
+        if filtered_df.empty:
+            st.info("当前筛选条件下没有订单明细。")
+        else:
+            detail_cols = [
+                "order_id",
+                "order_status",
+                "order_item_id",
+                "item_status",
+                "customer_name",
+                "po_no",
+                "customer_pn",
+                "spec_code",
+                "product_spec_text",
+                "special_process",
+                "material",
+                "ordered_qty",
+                "fulfilled_qty",
+                "order_item_shipped_qty",
+                "delivery_plan_id",
+                "delivery_batch_no",
+                "planned_delivery_date",
+                "planned_delivery_qty",
+                "actual_delivery_qty",
+                "delivery_status",
+                "trace_key"
+            ]
+
+            existing_cols = [c for c in detail_cols if c in filtered_df.columns]
+
+            show_df(filtered_df[existing_cols].rename(columns={
+                "order_id": "订单编号",
+                "order_status": "订单状态",
+                "order_item_id": "订单明细编号",
+                "item_status": "明细状态",
+                "customer_name": "客户",
+                "po_no": "PO",
+                "customer_pn": "客户料号",
+                "spec_code": "规格编码",
+                "product_spec_text": "规格文本",
+                "special_process": "特殊工艺",
+                "material": "材质",
+                "ordered_qty": "订单数量",
+                "fulfilled_qty": "已入库/完成数量",
+                "order_item_shipped_qty": "订单已出货数量",
+                "delivery_plan_id": "交付批次编号",
+                "delivery_batch_no": "交付批次",
+                "planned_delivery_date": "计划交付日期",
+                "planned_delivery_qty": "计划交付数量",
+                "actual_delivery_qty": "实际出货数量",
+                "delivery_status": "交付状态",
+                "trace_key": "Trace Key"
+            }), hide_index=True)
+
+    # =========================
+    # 5.3 全流程追踪
+    # =========================
+    with tab_flow:
+        st.subheader("单批次全流程追踪")
+
+        selectable_df = filtered_df[
+            filtered_df["delivery_plan_id"].notna()
+        ].copy()
+
+        if selectable_df.empty:
+            st.info("当前没有可选择的交付批次。")
+        else:
+            selected_dp_id = st.selectbox(
+                "选择交付批次查看全流程",
+                selectable_df["delivery_plan_id"].dropna().astype(int).tolist(),
+                format_func=lambda x: (
+                    f"DP {x}｜"
+                    f"PO {selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'po_no'].iloc[0]}｜"
+                    f"状态 {selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'delivery_status'].iloc[0]}｜"
+                    f"批号 {selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'batch_code'].iloc[0]}"
+                ),
+                key="control_tower_selected_delivery_plan"
+            )
+
+            selected = selectable_df[
+                selectable_df["delivery_plan_id"].astype(int) == int(selected_dp_id)
+            ].iloc[0]
+
+            st.markdown("### 状态卡片")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("交付状态", str(selected["delivery_status"]))
+            c2.metric("生产状态", str(selected["production_flow_status"]))
+            c3.metric("质检进度", str(selected["qc_progress"]))
+            c4.metric("同步检查", str(selected["sync_check"]))
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("计划交付", f"{float(selected['planned_delivery_qty'] or 0):.0f}")
+            c6.metric("已出货", f"{float(selected['actual_delivery_qty'] or 0):.0f}")
+            c7.metric("半成品", f"{float(selected['semi_finished_wh_qty'] or 0):.0f}")
+            c8.metric("成品库存", f"{float(selected['finished_wh_qty'] or 0):.0f}")
+
+            st.markdown("Trace Key")
+            st.code(str(selected["trace_key"]))
+
+            production_batch_id = selected["production_batch_id"]
+            order_item_id = selected["order_item_id"]
+
+            subtab_process, subtab_qc, subtab_inventory, subtab_ship, subtab_txn = st.tabs([
+                "工序日志",
+                "质检记录",
+                "库存 Lot",
+                "出货记录",
+                "库存流水"
+            ])
+
+            with subtab_process:
+                if pd.isna(production_batch_id):
+                    st.info("当前交付批次尚未关联生产批次。")
+                else:
+                    process_df = pd.read_sql_query("""
+                        SELECT
+                            process_log_id,
+                            process_step,
+                            equipment_code,
+                            operator_name,
+                            input_qty,
+                            output_qty,
+                            scrap_qty,
+                            process_status,
+                            start_time,
+                            end_time,
+                            remark
+                        FROM production_process_log
+                        WHERE production_batch_id = ?
+                        ORDER BY process_log_id
+                    """, conn, params=[int(production_batch_id)])
+
+                    if process_df.empty:
+                        st.info("当前没有工序日志。")
+                    else:
+                        show_df(process_df, hide_index=True)
+
+            with subtab_qc:
+                if pd.isna(production_batch_id):
+                    st.info("当前交付批次尚未关联生产批次。")
+                else:
+                    qc_df = pd.read_sql_query("""
+                        SELECT
+                            measurement_id,
+                            production_batch_id,
+                            quality_status,
+                            release_status,
+                            qc_before_qty,
+                            qc_after_qty,
+                            qc_loss_qty,
+                            qc_note,
+                            inspected_at,
+                            release_by
+                        FROM production_measurement
+                        WHERE production_batch_id = ?
+                        ORDER BY measurement_id DESC
+                    """, conn, params=[int(production_batch_id)])
+
+                    if qc_df.empty:
+                        st.info("当前没有质检记录。")
+                    else:
+                        show_df(qc_df, hide_index=True)
+
+            with subtab_inventory:
+                if pd.isna(production_batch_id):
+                    st.info("当前交付批次尚未关联生产批次。")
+                else:
+                    lot_df = pd.read_sql_query("""
+                        SELECT
+                            inventory_lot_id,
+                            lot_code,
+                            trace_key,
+                            location,
+                            available_qty,
+                            reserved_qty,
+                            lot_status,
+                            release_status,
+                            last_out_qty,
+                            last_out_time
+                        FROM inventory_lot
+                        WHERE production_batch_id = ?
+                        ORDER BY inventory_lot_id
+                    """, conn, params=[int(production_batch_id)])
+
+                    if lot_df.empty:
+                        st.info("当前没有库存 Lot。")
+                    else:
+                        show_df(lot_df, hide_index=True)
+
+            with subtab_ship:
+                ship_df = pd.read_sql_query("""
+                    SELECT
+                        s.shipment_id,
+                        s.shipment_no,
+                        s.ship_date,
+                        s.carrier,
+                        s.destination,
+                        s.created_by,
+                        s.shipment_status,
+                        si.shipment_item_id,
+                        si.inventory_lot_id,
+                        il.lot_code,
+                        il.location,
+                        si.shipped_qty,
+                        si.packaging_label_code,
+                        si.trace_key
+                    FROM shipment_item si
+                    LEFT JOIN shipment s
+                        ON si.shipment_id = s.shipment_id
+                    LEFT JOIN inventory_lot il
+                        ON si.inventory_lot_id = il.inventory_lot_id
+                    WHERE si.order_item_id = ?
+                    ORDER BY s.shipment_id DESC, si.shipment_item_id DESC
+                """, conn, params=[int(order_item_id)])
+
+                if ship_df.empty:
+                    st.info("当前没有出货记录。")
+                else:
+                    show_df(ship_df, hide_index=True)
+
+            with subtab_txn:
+                txn_df = pd.read_sql_query("""
+                    SELECT
+                        itl.txn_id,
+                        itl.inventory_lot_id,
+                        il.lot_code,
+                        il.location,
+                        il.trace_key,
+                        itl.txn_type,
+                        itl.qty,
+                        itl.txn_time,
+                        itl.txn_reason,
+                        itl.reference_no
+                    FROM inventory_transaction_log itl
+                    LEFT JOIN inventory_lot il
+                        ON itl.inventory_lot_id = il.inventory_lot_id
+                    WHERE il.production_batch_id = ?
+                       OR il.trace_key = ?
+                    ORDER BY itl.txn_id DESC
+                """, conn, params=[
+                    int(production_batch_id) if pd.notna(production_batch_id) else -1,
+                    str(selected["trace_key"])
+                ])
+
+                if txn_df.empty:
+                    st.info("当前没有库存流水。")
+                else:
+                    show_df(txn_df, hide_index=True)
+
+    # =========================
+    # 5.4 异常检查
+    # =========================
+    with tab_abnormal:
+        st.subheader("异常检查")
+
+        if abnormal_df.empty:
+            st.success("当前没有发现明显联动异常。")
+        else:
+            abnormal_cols = [
+                "sync_check",
+                "delivery_status",
+                "qc_progress",
+                "customer_name",
+                "po_no",
+                "delivery_plan_id",
+                "batch_code",
+                "semi_finished_process_output_qty",
+                "qc_before_qty",
+                "column_inspection_output_qty",
+                "end_inspection_output_qty",
+                "qc_after_qty",
+                "semi_finished_wh_qty",
+                "finished_wh_qty",
+                "inventory_total_qty",
+                "actual_delivery_qty",
+                "shipment_item_total_qty",
+                "order_item_shipped_qty",
+                "trace_key"
+            ]
+
+            existing_cols = [c for c in abnormal_cols if c in abnormal_df.columns]
+
+            show_df(abnormal_df[existing_cols].rename(columns={
+                "sync_check": "异常说明",
+                "delivery_status": "交付状态",
+                "qc_progress": "质检进度",
+                "customer_name": "客户",
+                "po_no": "PO",
+                "delivery_plan_id": "交付批次编号",
+                "batch_code": "生产批号",
+                "semi_finished_process_output_qty": "半成品仓产出",
+                "qc_before_qty": "质检前数量",
+                "column_inspection_output_qty": "柱检产出",
+                "end_inspection_output_qty": "端检产出",
+                "qc_after_qty": "质检后数量",
+                "semi_finished_wh_qty": "半成品账面数量",
+                "finished_wh_qty": "成品仓数量",
+                "inventory_total_qty": "库存Lot数量",
+                "actual_delivery_qty": "交付实际出货",
+                "shipment_item_total_qty": "出货明细合计",
+                "order_item_shipped_qty": "订单明细已出货",
+                "trace_key": "Trace Key"
+            }), hide_index=True)
+
+    # =========================
+    # 5.5 手动同步
+    # =========================
+    with tab_sync:
+        st.subheader("手动同步工具")
+        st.markdown("---")
+        st.subheader("历史数据异常修复")
+        st.warning(
+            "该按钮用于修复旧测试数据造成的数量不同步问题，例如："
+            "质检前数量未等于半成品仓产出、已入库但半成品数量未清零、"
+            "出货数量与出货明细不一致。"
+        )
+
+        if st.button("一键修复历史同步异常", key="repair_realtime_sync_anomalies_btn"):
+            ok, msg = repair_realtime_sync_anomalies(conn)
+            if ok:
+                st.cache_data.clear()
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        st.info(
+            "如果你刚完成质检、入库或出货后发现某个看板未及时变化，"
+            "可以在这里对指定交付批次执行一次统一同步。"
+        )
+
+        sync_df = control_df[
+            control_df["delivery_plan_id"].notna()
+        ].copy()
+
+        if sync_df.empty:
+            st.info("当前没有可同步的交付批次。")
+        else:
+            selected_sync_dp_id = st.selectbox(
+                "选择需要同步的交付批次",
+                sync_df["delivery_plan_id"].dropna().astype(int).tolist(),
+                format_func=lambda x: (
+                    f"DP {x}｜"
+                    f"PO {sync_df.loc[sync_df['delivery_plan_id'] == x, 'po_no'].iloc[0]}｜"
+                    f"状态 {sync_df.loc[sync_df['delivery_plan_id'] == x, 'delivery_status'].iloc[0]}"
+                ),
+                key="control_tower_sync_delivery_plan"
+            )
+
+            if st.button("执行统一同步", key="control_tower_run_sync"):
+                if "sync_after_delivery_plan_change" in globals():
+                    sync_after_delivery_plan_change(conn, int(selected_sync_dp_id))
+                    st.cache_data.clear()
+                    st.success(f"已对交付批次 {selected_sync_dp_id} 执行统一同步。")
+                    st.rerun()
+                else:
+                    st.error("未找到 sync_after_delivery_plan_change()，无法执行同步。")
+
+            st.markdown("---")
+
+            if st.button("一键同步全部交付批次", key="control_tower_run_sync_all"):
+                if "sync_after_delivery_plan_change" in globals():
+                    dp_ids = sync_df["delivery_plan_id"].dropna().astype(int).unique().tolist()
+                    ok_count = 0
+
+                    for dp_id in dp_ids:
+                        try:
+                            sync_after_delivery_plan_change(conn, int(dp_id))
+                            ok_count += 1
+                        except Exception:
+                            pass
+
+                    st.cache_data.clear()
+                    st.success(f"已尝试同步 {ok_count} 个交付批次。")
+                    st.rerun()
+                else:
+                    st.error("未找到 sync_after_delivery_plan_change()，无法执行同步。")
 
 
 def page_delivery_plan(conn):
