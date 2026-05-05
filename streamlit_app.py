@@ -9237,7 +9237,6 @@ def page_production_process_entry(conn):
     else:
         show_df(all_log_df, hide_index=True)
 
-
 def page_production_process_entry(conn):
     st.header("生产｜生产过程录入")
 
@@ -9245,54 +9244,40 @@ def page_production_process_entry(conn):
         "本页面已启用动态生产路线："
         "无特殊工艺：切割 → 粗洗 → 精洗 → 半成品仓库；"
         "有特殊工艺：切割 → 粗洗 → 精洗1 → 特殊工艺 → 精洗2 → 半成品仓库。"
-        "同时保留数量自动流转：第一道工序投入数量 = 应生产数量；"
-        "后续工序投入数量 = 上一道已完成工序的产出数量；"
+        "数量规则：第一道工序投入数量默认等于应生产数量；"
+        "后续工序投入数量默认等于上一道已完成工序的产出数量；"
         "报废数量 = 投入数量 - 产出数量。"
+        "重要：产出数量只允许小于等于本工序投入数量，不再受订单数量、计划交付数量或应生产数量限制；"
+        "超出订单计划的合格数量后续可在入库时进入规格化库存 WH-SPEC。"
     )
 
     # =========================
-    # 0. 本函数内置路线工具
-    # 如果你前面已经在全局加过同名函数，也不冲突；
-    # 这里优先保证本函数可以独立运行。
+    # 0. 兼容全局路线函数
     # =========================
-    NO_SPECIAL_PROCESS_VALUES = [
-        "",
-        "STANDARD",
-        "NONE",
-        "NO",
-        "N/A",
-        "NA",
-        "无",
-        "无特殊工艺",
-    ]
+    def _has_special_process_local(special_process):
+        if "has_special_process" in globals():
+            return has_special_process(special_process)
 
-    PROCESS_CN = {
-        "Cutting": "切割",
-        "Rough Cleaning": "粗洗",
-        "Fine Cleaning": "精洗",
-        "Fine Cleaning 1": "精洗 1",
-        "Fine Cleaning 2": "精洗 2",
-        "Semi Finished Warehouse": "半成品仓库",
-
-        "LASER": "激光",
-        "CHAMFER": "倒角",
-        "DRILLING": "打孔",
-
-        "Column Inspection": "柱检",
-        "End Inspection": "端检",
-    }
-
-    def _has_special_process(special_process):
+        no_values = [
+            "",
+            "STANDARD",
+            "NONE",
+            "NO",
+            "N/A",
+            "NA",
+            "无",
+            "无特殊工艺",
+        ]
         sp = normalize_text(special_process).upper()
-        return sp not in NO_SPECIAL_PROCESS_VALUES
+        return sp not in no_values
 
-    def _get_process_cn(process_step):
-        return PROCESS_CN.get(str(process_step), str(process_step))
+    def _get_production_route_local(special_process):
+        if "get_production_route" in globals():
+            return get_production_route(special_process)
 
-    def _get_production_route(special_process):
         sp = normalize_text(special_process).upper()
 
-        if not _has_special_process(sp):
+        if not _has_special_process_local(sp):
             return [
                 "Cutting",
                 "Rough Cleaning",
@@ -9309,10 +9294,34 @@ def page_production_process_entry(conn):
             "Semi Finished Warehouse",
         ]
 
-    def _is_final_production_step(process_step, special_process):
-        route = _get_production_route(special_process)
+    def _get_process_cn_local(process_step):
+        if "get_process_cn" in globals():
+            return get_process_cn(process_step)
+
+        process_cn = {
+            "Cutting": "切割",
+            "Rough Cleaning": "粗洗",
+            "Fine Cleaning": "精洗",
+            "Fine Cleaning 1": "精洗 1",
+            "Fine Cleaning 2": "精洗 2",
+            "Semi Finished Warehouse": "半成品仓库",
+            "LASER": "激光",
+            "CHAMFER": "倒角",
+            "DRILLING": "打孔",
+            "Column Inspection": "柱检",
+            "End Inspection": "端检",
+        }
+
+        return process_cn.get(str(process_step), str(process_step))
+
+    def _is_final_production_step_local(process_step, special_process):
+        if "is_final_production_step" in globals():
+            return is_final_production_step(process_step, special_process)
+
+        route = _get_production_route_local(special_process)
         if not route:
             return False
+
         return normalize_text(process_step) == normalize_text(route[-1])
 
     # =========================
@@ -9345,11 +9354,13 @@ def page_production_process_entry(conn):
             COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
             COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
 
+            c.customer_name,
             oi.po_no,
             oi.customer_pn,
-            oi.product_spec_text,
             oi.product_type_text,
-            c.customer_name
+            oi.product_spec_text,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.shipped_qty, 0) AS shipped_qty
 
         FROM production_schedule ps
         JOIN production_batch pb
@@ -9362,13 +9373,26 @@ def page_production_process_entry(conn):
             ON oi.order_id = o.order_id
         LEFT JOIN customer c
             ON o.customer_id = c.customer_id
+
+        WHERE COALESCE(dp.delivery_status, '未排产') IN (
+            '已排产',
+            '生产中',
+            '质检中',
+            '待入库确认',
+            '已入库'
+        )
+        OR COALESCE(pb.production_flow_status, 'planned') NOT IN (
+            '已入库',
+            'completed'
+        )
+
         ORDER BY
             ps.production_schedule_id DESC,
-            pb.production_batch_id DESC
+            ps.production_batch_id DESC
     """, conn)
 
     if batch_df.empty:
-        st.info("当前没有可录入生产过程的生产批次。请先在排产看板完成生产确认。")
+        st.info("当前没有可录入的生产批次。请先在【排产看板】中完成生产确认。")
         return
 
     # =========================
@@ -9378,14 +9402,14 @@ def page_production_process_entry(conn):
         "选择生产批次",
         batch_df["production_batch_id"].tolist(),
         format_func=lambda x: (
-            f"[{batch_df.loc[batch_df['production_batch_id'] == x, 'delivery_status'].iloc[0]}] "
-            f"批次 {batch_df.loc[batch_df['production_batch_id'] == x, 'batch_code'].iloc[0]}｜"
-            f"PO {batch_df.loc[batch_df['production_batch_id'] == x, 'po_no'].iloc[0]}｜"
-            f"交付第 {int(batch_df.loc[batch_df['production_batch_id'] == x, 'delivery_batch_no'].iloc[0] or 1)} 批｜"
-            f"特殊工艺 {batch_df.loc[batch_df['production_batch_id'] == x, 'special_process'].iloc[0]}｜"
-            f"材质 {batch_df.loc[batch_df['production_batch_id'] == x, 'material'].iloc[0]}"
+            f"{x} | "
+            f"{batch_df.loc[batch_df['production_batch_id'] == x, 'batch_code'].iloc[0]} | "
+            f"PO {batch_df.loc[batch_df['production_batch_id'] == x, 'po_no'].iloc[0]} | "
+            f"交付批次 {int(batch_df.loc[batch_df['production_batch_id'] == x, 'delivery_batch_no'].iloc[0] or 1)} | "
+            f"计划交付 {float(batch_df.loc[batch_df['production_batch_id'] == x, 'planned_delivery_qty'].iloc[0] or 0):.0f} | "
+            f"应生产 {float(batch_df.loc[batch_df['production_batch_id'] == x, 'required_production_qty'].iloc[0] or 0):.0f}"
         ),
-        key="production_process_batch_select"
+        key="production_process_entry_batch_select"
     )
 
     selected = batch_df[
@@ -9393,49 +9417,51 @@ def page_production_process_entry(conn):
     ].iloc[0]
 
     batch_id = int(selected["production_batch_id"])
-    special_process = normalize_text(selected["special_process"]) or "STANDARD"
-    process_flow = _get_production_route(special_process)
+    special_process = normalize_text(selected["special_process"]).upper() or "STANDARD"
+    material = normalize_text(selected["material"]).upper() or "UNKNOWN_MATERIAL"
+
+    process_flow = _get_production_route_local(special_process)
 
     # =========================
-    # 3. 当前批次基础信息
+    # 3. 当前批次卡片
     # =========================
     st.markdown("### 当前生产批次信息")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("生产批次", str(selected["batch_code"]))
-    c2.metric("PO", str(selected["po_no"]))
-    c3.metric("交付批次", f"第 {int(selected['delivery_batch_no'] or 1)} 批")
-    c4.metric("交付状态", str(selected["delivery_status"]))
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("生产批号", str(selected["batch_code"]))
+    b2.metric("客户", str(selected["customer_name"]))
+    b3.metric("PO", str(selected["po_no"]))
+    b4.metric("交付批次", f"第 {int(selected['delivery_batch_no'] or 1)} 批")
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("应生产数量", f"{float(selected['required_production_qty'] or 0):.0f}")
-    c6.metric("当前实际数量", f"{float(selected['actual_qty'] or 0):.0f}")
-    c7.metric("半成品数量", f"{float(selected['semi_finished_wh_qty'] or 0):.0f}")
-    c8.metric("成品数量", f"{float(selected['finished_wh_qty'] or 0):.0f}")
+    b5, b6, b7, b8 = st.columns(4)
+    b5.metric("订单数量", f"{float(selected['ordered_qty'] or 0):.0f}")
+    b6.metric("计划交付数量", f"{float(selected['planned_delivery_qty'] or 0):.0f}")
+    b7.metric("应生产数量", f"{float(selected['required_production_qty'] or 0):.0f}")
+    b8.metric("当前实际数量", f"{float(selected['actual_qty'] or 0):.0f}")
 
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("特殊工艺", special_process)
-    c10.metric("材质", str(selected["material"]))
-    c11.metric("通规尺寸", str(selected["common_gauge_size"]))
-    c12.metric("止规尺寸", str(selected["stop_gauge_size"]))
+    b9, b10, b11, b12 = st.columns(4)
+    b9.metric("特殊工艺", special_process)
+    b10.metric("材质", material)
+    b11.metric("生产状态", str(selected["production_flow_status"]))
+    b12.metric("交付状态", str(selected["delivery_status"]))
 
     st.caption(
-        f"客户：{selected['customer_name']} ｜ "
-        f"客户料号：{selected['customer_pn']} ｜ "
         f"产品：{selected['product_type_text']} ｜ "
         f"规格：{selected['product_spec_text']} ｜ "
-        f"Trace Key：{selected['trace_key']}"
+        f"客户料号：{selected['customer_pn']} ｜ "
+        f"通规：{selected['common_gauge_size']} ｜ "
+        f"止规：{selected['stop_gauge_size']}"
     )
 
-    st.markdown("### 当前批次生产路线")
+    st.markdown("Trace Key")
+    st.code(str(selected["trace_key"]))
 
+    st.markdown("#### 当前生产路线")
     route_text = " → ".join([
-        f"{step}（{_get_process_cn(step)}）"
+        f"{step} / {_get_process_cn_local(step)}"
         for step in process_flow
     ])
-    st.info(route_text)
-
-    st.markdown("---")
+    st.success(route_text)
 
     # =========================
     # 4. 当前批次工序记录
@@ -9459,19 +9485,14 @@ def page_production_process_entry(conn):
         ORDER BY process_log_id ASC
     """, conn, params=[batch_id])
 
-    if current_log_df.empty:
-        done_log_df = pd.DataFrame()
-        completed_steps = []
-    else:
-        done_log_df = current_log_df[
-            current_log_df["process_status"].astype(str).str.lower() == "done"
-        ].copy()
-        completed_steps = done_log_df["process_step"].astype(str).tolist()
+    done_log_df = current_log_df[
+        current_log_df["process_status"].astype(str).str.lower() == "done"
+    ].copy()
 
-    # 只统计当前动态路线内的已完成工序
+    completed_steps = done_log_df["process_step"].astype(str).tolist()
     completed_route_steps = [
-        step for step in completed_steps
-        if step in process_flow
+        x for x in completed_steps
+        if x in process_flow
     ]
 
     suggested_process_step = None
@@ -9486,7 +9507,7 @@ def page_production_process_entry(conn):
         suggested_process_step = process_flow[-1]
 
     completed_count = len(set(completed_route_steps))
-    progress_ratio = completed_count / len(process_flow) if process_flow else 0
+    progress_ratio = completed_count / len(process_flow) if process_flow else 0.0
 
     if not done_log_df.empty:
         latest_done = done_log_df.sort_values("process_log_id").iloc[-1]
@@ -9495,11 +9516,6 @@ def page_production_process_entry(conn):
     else:
         latest_done_step = "-"
         latest_done_output = 0.0
-
-    if latest_done_output > 0:
-        default_input_qty = latest_done_output
-    else:
-        default_input_qty = float(selected["required_production_qty"] or 0)
 
     total_input_qty = pd.to_numeric(
         current_log_df["input_qty"],
@@ -9517,7 +9533,7 @@ def page_production_process_entry(conn):
     ).fillna(0).sum() if not current_log_df.empty else 0.0
 
     # =========================
-    # 5. 页面内分区跳转
+    # 5. 页面内分区
     # =========================
     section_options = [
         "① 生产任务卡",
@@ -9564,62 +9580,56 @@ def page_production_process_entry(conn):
         else:
             st.info(
                 f"建议下一道工序：{suggested_process_step} / "
-                f"{_get_process_cn(suggested_process_step)}"
+                f"{_get_process_cn_local(suggested_process_step)}"
             )
 
         st.markdown("#### 路线进度")
 
         route_rows = []
         for idx, step in enumerate(process_flow, start=1):
-            step_logs = current_log_df[
-                current_log_df["process_step"].astype(str) == step
-            ] if not current_log_df.empty else pd.DataFrame()
+            step_done_df = done_log_df[
+                done_log_df["process_step"].astype(str) == step
+            ].copy()
 
-            done_logs = step_logs[
-                step_logs["process_status"].astype(str).str.lower() == "done"
-            ] if not step_logs.empty else pd.DataFrame()
-
-            if not done_logs.empty:
-                latest_step_log = done_logs.sort_values("process_log_id").iloc[-1]
-                status = "已完成"
-                input_qty_show = float(latest_step_log["input_qty"] or 0)
-                output_qty_show = float(latest_step_log["output_qty"] or 0)
-                scrap_qty_show = float(latest_step_log["scrap_qty"] or 0)
-            elif step == suggested_process_step and not route_all_done:
-                status = "当前应录入"
-                input_qty_show = default_input_qty
-                output_qty_show = 0
-                scrap_qty_show = 0
-            else:
-                status = "待执行"
+            if step_done_df.empty:
+                status_text = "待执行"
                 input_qty_show = 0
                 output_qty_show = 0
                 scrap_qty_show = 0
+                done_time = ""
+            else:
+                last_step = step_done_df.sort_values("process_log_id").iloc[-1]
+                status_text = "已完成"
+                input_qty_show = float(last_step["input_qty"] or 0)
+                output_qty_show = float(last_step["output_qty"] or 0)
+                scrap_qty_show = float(last_step["scrap_qty"] or 0)
+                done_time = last_step["end_time"]
 
             route_rows.append({
                 "序号": idx,
                 "工序": step,
-                "中文": _get_process_cn(step),
-                "状态": status,
+                "中文": _get_process_cn_local(step),
+                "状态": status_text,
                 "投入数量": input_qty_show,
                 "产出数量": output_qty_show,
                 "报废数量": scrap_qty_show,
+                "完成时间": done_time,
             })
 
-        show_df(pd.DataFrame(route_rows), hide_index=True)
+        route_df = pd.DataFrame(route_rows)
+        show_df(route_df, hide_index=True)
 
         st.markdown("---")
 
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("进入工序录入", key="go_to_process_entry_form"):
-                st.session_state["_next_process_entry_section"] = "② 录入本次工序"
-                st.rerun()
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("累计投入", f"{float(total_input_qty):.0f}")
+        s2.metric("累计产出", f"{float(total_output_qty):.0f}")
+        s3.metric("累计报废", f"{float(total_scrap_qty):.0f}")
+        s4.metric("半成品仓数量", f"{float(selected['semi_finished_wh_qty'] or 0):.0f}")
 
-        with b2:
-            if st.button("查看工序记录", key="go_to_process_log_list"):
-                st.session_state["_next_process_entry_section"] = "③ 工序记录"
-                st.rerun()
+        if st.button("进入工序录入", key=f"go_process_entry_{batch_id}"):
+            st.session_state["_next_process_entry_section"] = "② 录入本次工序"
+            st.rerun()
 
     # =========================
     # 7. 录入本次工序
@@ -9628,95 +9638,131 @@ def page_production_process_entry(conn):
         st.subheader("录入本次工序")
 
         if route_all_done:
-            st.success("该批次生产路线已全部完成，无需继续录入生产工序。")
-            st.info("如果需要修正，请后续使用修正 / 冲销功能，不建议直接重复录入。")
-        else:
-            st.info(
-                f"系统建议录入：{suggested_process_step} / "
-                f"{_get_process_cn(suggested_process_step)}。"
-                "为了防止跳步，默认只允许选择当前应录入工序。"
+            st.success("该批次生产路线已经全部完成。如需补录，请选择对应工序，但系统会禁止重复提交 done。")
+
+        # 默认选择建议工序
+        suggested_index = 0
+        if suggested_process_step in process_flow:
+            suggested_index = process_flow.index(suggested_process_step)
+
+        process_step = st.selectbox(
+            "工序",
+            process_flow,
+            index=suggested_index,
+            format_func=lambda x: f"{x} / {_get_process_cn_local(x)}",
+            key=f"process_step_select_{batch_id}"
+        )
+
+        selected_process_index = process_flow.index(process_step)
+
+        # =========================
+        # 根据选择工序自动计算默认投入数量
+        # =========================
+        if selected_process_index == 0:
+            default_input_qty = float(selected["required_production_qty"] or 0)
+            input_source_text = (
+                f"当前为第一道工序 {process_step} / {_get_process_cn_local(process_step)}，"
+                f"默认投入数量 = 应生产数量 {default_input_qty:.0f}。"
+                "如实际投产数量高于订单/交付计划，可手动调高投入数量。"
             )
+        else:
+            previous_step = process_flow[selected_process_index - 1]
 
-            available_steps = [suggested_process_step]
+            previous_done_df = done_log_df[
+                done_log_df["process_step"].astype(str) == previous_step
+            ].copy()
 
-            with st.form(key=f"process_entry_form_{batch_id}"):
-                process_step = st.selectbox(
-                    "工序",
-                    available_steps,
-                    index=0,
-                    format_func=lambda x: f"{x} / {_get_process_cn(x)}",
-                    key=f"process_step_{batch_id}"
+            if not previous_done_df.empty:
+                previous_done = previous_done_df.sort_values("process_log_id").iloc[-1]
+                default_input_qty = float(previous_done["output_qty"] or 0)
+                input_source_text = (
+                    f"当前工序 {process_step} / {_get_process_cn_local(process_step)} "
+                    f"自动继承上一道工序 {previous_step} / {_get_process_cn_local(previous_step)} "
+                    f"的产出数量：{default_input_qty:.0f}。"
+                )
+            elif not done_log_df.empty:
+                latest_done_for_input = done_log_df.sort_values("process_log_id").iloc[-1]
+                default_input_qty = float(latest_done_for_input["output_qty"] or 0)
+                input_source_text = (
+                    f"未找到上一道标准工序 {previous_step} / {_get_process_cn_local(previous_step)} 的完成记录，"
+                    f"暂时继承最近完成工序 {latest_done_for_input['process_step']} "
+                    f"的产出数量：{default_input_qty:.0f}。"
+                )
+            else:
+                default_input_qty = float(selected["required_production_qty"] or 0)
+                input_source_text = (
+                    f"当前尚无已完成工序，默认投入数量 = 应生产数量 {default_input_qty:.0f}。"
                 )
 
-                p1, p2, p3 = st.columns(3)
+        st.success(input_source_text)
 
-                with p1:
-                    input_qty = st.number_input(
-                        "投入数量",
-                        min_value=0.0,
-                        value=float(default_input_qty or 0),
-                        step=1.0,
-                        key=f"input_qty_{batch_id}_{process_step}"
-                    )
+        if process_step in completed_steps:
+            st.warning(
+                f"注意：工序 {process_step} / {_get_process_cn_local(process_step)} "
+                "已经存在 done 记录。若再次选择 done，系统会禁止重复提交。"
+            )
 
-                with p2:
-                    output_qty = st.number_input(
-                        "产出数量",
-                        min_value=0.0,
-                        max_value=float(input_qty or 0),
-                        value=float(input_qty or 0),
-                        step=1.0,
-                        key=f"output_qty_{batch_id}_{process_step}"
-                    )
+        with st.form(key=f"production_process_entry_form_{batch_id}_{process_step}"):
+            f1, f2 = st.columns(2)
 
-                with p3:
-                    scrap_qty = max(float(input_qty or 0) - float(output_qty or 0), 0.0)
-                    st.metric("自动计算报废数量", f"{scrap_qty:.0f}")
+            with f1:
+                equipment_code = st.text_input(
+                    "设备编号",
+                    value=f"EQ-{normalize_trace_part(process_step, 'STEP')}-001",
+                    key=f"equipment_code_{batch_id}_{process_step}"
+                )
 
-                p4, p5, p6 = st.columns(3)
+                operator_name = st.text_input(
+                    "操作员",
+                    value="Operator A",
+                    key=f"operator_name_{batch_id}_{process_step}"
+                )
 
-                with p4:
-                    process_status = st.selectbox(
-                        "工序状态",
-                        ["done", "running", "hold"],
-                        index=0,
-                        format_func=lambda x: {
-                            "done": "已完成",
-                            "running": "进行中",
-                            "hold": "暂停 / 异常"
-                        }.get(x, x),
-                        key=f"process_status_{batch_id}_{process_step}"
-                    )
+                input_qty = st.number_input(
+                    "投入数量（系统自动带入，可调整）",
+                    min_value=0.0,
+                    value=float(default_input_qty),
+                    step=1.0,
+                    key=f"input_qty_auto_{batch_id}_{process_step}_{default_input_qty}"
+                )
 
-                with p5:
-                    equipment_code = st.text_input(
-                        "设备编号",
-                        value="",
-                        key=f"equipment_code_{batch_id}_{process_step}"
-                    )
+                # =====================================================
+                # 核心修改：
+                # 产出数量只限制 <= 本工序投入数量。
+                # 不再限制 <= 订单数量 / 计划交付数量 / 应生产数量。
+                # 这样允许合理超产，后续可进入规格化库存 WH-SPEC。
+                # =====================================================
+                max_output_qty = float(input_qty or 0)
+                default_output_qty = min(float(default_input_qty or 0), max_output_qty)
 
-                with p6:
-                    operator_name = st.text_input(
-                        "操作员",
-                        value="",
-                        key=f"operator_name_{batch_id}_{process_step}"
-                    )
+                output_qty = st.number_input(
+                    "产出数量",
+                    min_value=0.0,
+                    max_value=float(max_output_qty),
+                    value=float(default_output_qty),
+                    step=1.0,
+                    key=f"output_qty_auto_{batch_id}_{process_step}_{default_input_qty}_{max_output_qty}"
+                )
 
-                t1, t2 = st.columns(2)
+            with f2:
+                process_status = st.selectbox(
+                    "工序状态",
+                    ["done", "running", "hold"],
+                    index=0,
+                    key=f"process_status_{batch_id}_{process_step}"
+                )
 
-                with t1:
-                    start_time = st.text_input(
-                        "开始时间",
-                        value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        key=f"start_time_{batch_id}_{process_step}"
-                    )
+                start_time = st.text_input(
+                    "开始时间",
+                    value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    key=f"start_time_{batch_id}_{process_step}"
+                )
 
-                with t2:
-                    end_time = st.text_input(
-                        "结束时间",
-                        value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        key=f"end_time_{batch_id}_{process_step}"
-                    )
+                end_time = st.text_input(
+                    "结束时间",
+                    value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    key=f"end_time_{batch_id}_{process_step}"
+                )
 
                 remark = st.text_area(
                     "备注",
@@ -9724,94 +9770,152 @@ def page_production_process_entry(conn):
                     key=f"remark_{batch_id}_{process_step}"
                 )
 
-                submitted = st.form_submit_button("提交生产过程记录")
+            calculated_scrap_qty = max(float(input_qty or 0) - float(output_qty or 0), 0.0)
 
-            if submitted:
-                try:
-                    cursor = conn.cursor()
+            st.markdown("---")
+            st.subheader("数量自动计算结果")
 
-                    # =========================
-                    # 防重复 done
-                    # =========================
-                    if process_status == "done":
-                        exists_done_df = pd.read_sql_query("""
-                            SELECT COUNT(*) AS cnt
-                            FROM production_process_log
-                            WHERE production_batch_id = ?
-                              AND process_step = ?
-                              AND process_status = 'done'
-                        """, conn, params=[
-                            int(batch_id),
-                            process_step
-                        ])
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("本工序投入数量", f"{float(input_qty or 0):.0f}")
+            r2.metric("本工序产出数量", f"{float(output_qty or 0):.0f}")
+            r3.metric("自动计算报废数量", f"{float(calculated_scrap_qty):.0f}")
+            r4.metric(
+                "良率",
+                f"{(float(output_qty or 0) / float(input_qty or 0) * 100):.2f}%"
+                if float(input_qty or 0) > 0 else "0.00%"
+            )
 
-                        exists_done = int(exists_done_df.iloc[0]["cnt"] or 0)
+            st.info(
+                "当前数量校验规则：产出数量 ≤ 投入数量。"
+                "系统不会用订单数量、计划交付数量或应生产数量限制产出。"
+            )
 
-                        if exists_done > 0:
-                            st.error(
-                                f"该批次的工序 {process_step} / "
-                                f"{_get_process_cn(process_step)} 已经完成，不能重复提交 done。"
-                            )
-                            return
+            submitted = st.form_submit_button("提交生产过程记录")
 
-                    if float(output_qty or 0) > float(input_qty or 0):
-                        st.error("产出数量不能大于投入数量。")
+        if submitted:
+            try:
+                cursor = conn.cursor()
+
+                # =========================
+                # 提交前校验
+                # =========================
+                if float(input_qty or 0) < 0:
+                    st.error("投入数量不能小于 0。")
+                    return
+
+                if float(output_qty or 0) < 0:
+                    st.error("产出数量不能小于 0。")
+                    return
+
+                if float(output_qty or 0) > float(input_qty or 0):
+                    st.error("产出数量不能大于投入数量。")
+                    return
+
+                if process_status == "done" and float(output_qty or 0) <= 0:
+                    st.error("工序状态为 done 时，产出数量必须大于 0。")
+                    return
+
+                # 防重复 done
+                if process_status == "done":
+                    exists_done_df = pd.read_sql_query("""
+                        SELECT COUNT(*) AS cnt
+                        FROM production_process_log
+                        WHERE production_batch_id = ?
+                          AND process_step = ?
+                          AND process_status = 'done'
+                    """, conn, params=[
+                        int(batch_id),
+                        process_step
+                    ])
+
+                    exists_done = int(exists_done_df.iloc[0]["cnt"] or 0)
+
+                    if exists_done > 0:
+                        st.error(
+                            f"该批次的工序 {process_step} / "
+                            f"{_get_process_cn_local(process_step)} 已经完成，不能重复提交 done。"
+                        )
                         return
 
-                    scrap_qty = max(float(input_qty or 0) - float(output_qty or 0), 0.0)
+                scrap_qty = max(float(input_qty or 0) - float(output_qty or 0), 0.0)
 
-                    # =========================
-                    # 写入工序日志
-                    # =========================
-                    cursor.execute("""
-                        INSERT INTO production_process_log (
-                            production_batch_id,
-                            process_step,
-                            equipment_code,
-                            operator_name,
-                            input_qty,
-                            output_qty,
-                            scrap_qty,
-                            process_status,
-                            start_time,
-                            end_time,
-                            remark
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        int(batch_id),
+                # =========================
+                # 写入工序日志
+                # =========================
+                cursor.execute("""
+                    INSERT INTO production_process_log (
+                        production_batch_id,
                         process_step,
-                        normalize_text(equipment_code),
-                        normalize_text(operator_name),
-                        float(input_qty),
-                        float(output_qty),
-                        float(scrap_qty),
+                        equipment_code,
+                        operator_name,
+                        input_qty,
+                        output_qty,
+                        scrap_qty,
                         process_status,
-                        normalize_text(start_time),
-                        normalize_text(end_time),
-                        normalize_text(remark)
-                    ))
+                        start_time,
+                        end_time,
+                        remark
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    int(batch_id),
+                    process_step,
+                    normalize_text(equipment_code),
+                    normalize_text(operator_name),
+                    float(input_qty),
+                    float(output_qty),
+                    float(scrap_qty),
+                    process_status,
+                    normalize_text(start_time),
+                    normalize_text(end_time),
+                    normalize_text(remark)
+                ))
 
-                    # =========================
-                    # 更新生产批次状态
-                    # =========================
-                    if process_status in ("running", "done"):
-                        new_flow_status = process_step
-                    elif process_status == "hold":
-                        new_flow_status = "hold"
-                    else:
-                        new_flow_status = str(selected["production_flow_status"])
-
-                    final_step_done = (
-                        process_status == "done"
-                        and _is_final_production_step(
-                            process_step,
-                            selected["special_process"]
-                        )
+                # =========================
+                # 判断是否为最后一道生产工序
+                # =========================
+                final_step_done = (
+                    process_status == "done"
+                    and _is_final_production_step_local(
+                        process_step,
+                        special_process
                     )
+                )
 
-                    if final_step_done:
-                        new_flow_status = "质检中"
+                if process_status in ("running", "done"):
+                    new_flow_status = process_step
+                elif process_status == "hold":
+                    new_flow_status = "hold"
+                else:
+                    new_flow_status = str(selected["production_flow_status"])
 
+                if final_step_done:
+                    new_flow_status = "质检中"
+
+                # =========================
+                # 更新生产批次
+                # 普通工序：
+                # - actual_qty 记录当前最大产出
+                #
+                # 最后一道 Semi Finished Warehouse：
+                # - actual_qty = 最终半成品产出
+                # - semi_finished_wh_qty = 最终半成品产出
+                # - 进入质检中
+                # =========================
+                if final_step_done:
+                    cursor.execute("""
+                        UPDATE production_batch
+                        SET production_flow_status = ?,
+                            actual_qty = ?,
+                            semi_finished_wh_qty = ?,
+                            finished_wh_qty = COALESCE(finished_wh_qty, 0)
+                        WHERE production_batch_id = ?
+                    """, (
+                        new_flow_status,
+                        float(output_qty),
+                        float(output_qty),
+                        int(batch_id)
+                    ))
+                else:
                     cursor.execute("""
                         UPDATE production_batch
                         SET production_flow_status = ?,
@@ -9827,110 +9931,139 @@ def page_production_process_entry(conn):
                         int(batch_id)
                     ))
 
-                    # =========================
-                    # 普通生产中状态同步
-                    # =========================
-                    if pd.notna(selected["delivery_plan_id"]):
+                # =========================
+                # 更新交付批次状态
+                # =========================
+                if pd.notna(selected["delivery_plan_id"]):
+                    if final_step_done:
+                        cursor.execute("""
+                            UPDATE delivery_plan
+                            SET delivery_status = '质检中'
+                            WHERE delivery_plan_id = ?
+                              AND COALESCE(delivery_status, '') NOT IN (
+                                  '待入库确认',
+                                  '已入库',
+                                  '已出货'
+                              )
+                        """, (
+                            int(selected["delivery_plan_id"]),
+                        ))
+                    else:
                         cursor.execute("""
                             UPDATE delivery_plan
                             SET delivery_status = '生产中'
                             WHERE delivery_plan_id = ?
-                              AND COALESCE(delivery_status, '') NOT IN ('已入库', '待入库确认', '质检中')
+                              AND COALESCE(delivery_status, '') NOT IN (
+                                  '质检中',
+                                  '待入库确认',
+                                  '已入库',
+                                  '已出货'
+                              )
                         """, (
                             int(selected["delivery_plan_id"]),
                         ))
 
-                    conn.commit()
+                # =========================
+                # 最后一道完成后，建立 / 更新质检记录
+                # 让 qc_before_qty = 半成品仓产出数量
+                # =========================
+                if final_step_done:
+                    measurement_exists_df = pd.read_sql_query("""
+                        SELECT COUNT(*) AS cnt
+                        FROM production_measurement
+                        WHERE production_batch_id = ?
+                    """, conn, params=[int(batch_id)])
 
-                    # =========================
-                    # 最后一道工序完成：进入半成品仓 / 质检中
-                    # =========================
-                    if final_step_done:
-                        if "auto_create_qc_after_production_done" in globals():
-                            auto_create_qc_after_production_done(conn, int(batch_id))
-                        else:
-                            cur2 = conn.cursor()
+                    measurement_exists = int(measurement_exists_df.iloc[0]["cnt"] or 0)
 
-                            qc_exists_df = pd.read_sql_query("""
-                                SELECT COUNT(*) AS cnt
-                                FROM production_measurement
-                                WHERE production_batch_id = ?
-                            """, conn, params=[int(batch_id)])
-
-                            qc_exists = int(qc_exists_df.iloc[0]["cnt"] or 0)
-
-                            if qc_exists == 0:
-                                cur2.execute("""
-                                    INSERT INTO production_measurement (
-                                        production_batch_id,
-                                        quality_status,
-                                        release_status,
-                                        inspected_at,
-                                        release_by
-                                    ) VALUES (?, 'Pending', 'pending', datetime('now'), 'Auto QC')
-                                """, (
-                                    int(batch_id),
-                                ))
-
-                            cur2.execute("""
-                                UPDATE production_batch
-                                SET semi_finished_wh_qty = ?,
-                                    production_flow_status = '质检中'
-                                WHERE production_batch_id = ?
-                            """, (
-                                float(output_qty),
-                                int(batch_id)
-                            ))
-
-                            if pd.notna(selected["delivery_plan_id"]):
-                                cur2.execute("""
-                                    UPDATE delivery_plan
-                                    SET delivery_status = '质检中'
-                                    WHERE delivery_plan_id = ?
-                                """, (
-                                    int(selected["delivery_plan_id"]),
-                                ))
-
-                            conn.commit()
-
-                    # =========================
-                    # 统一同步
-                    # =========================
-                    if (
-                        pd.notna(selected["delivery_plan_id"])
-                        and "sync_after_delivery_plan_change" in globals()
-                    ):
-                        sync_after_delivery_plan_change(
-                            conn,
-                            int(selected["delivery_plan_id"])
-                        )
-
-                    st.session_state["selected_process_batch_id"] = int(batch_id)
-                    st.session_state["process_entry_just_updated"] = True
-                    st.session_state["_next_process_entry_section"] = "① 生产任务卡"
-
-                    if final_step_done:
-                        st.success(
-                            "生产路线最后一道工序已完成，"
-                            "系统已自动同步至半成品仓并进入质检中。"
-                        )
+                    if measurement_exists == 0:
+                        cursor.execute("""
+                            INSERT INTO production_measurement (
+                                production_batch_id,
+                                quality_status,
+                                release_status,
+                                inspected_at,
+                                release_by,
+                                qc_before_qty,
+                                qc_after_qty,
+                                qc_loss_qty,
+                                qc_note
+                            ) VALUES (?, 'Pending', 'pending', ?, 'System Auto', ?, 0, 0, ?)
+                        """, (
+                            int(batch_id),
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            float(output_qty),
+                            "生产最后一道工序完成后自动进入半成品仓，待柱检 / 端检"
+                        ))
                     else:
-                        st.success(
-                            f"工序 {process_step} / {_get_process_cn(process_step)} 已提交。"
-                            f"投入 {float(input_qty):.0f}，"
-                            f"产出 {float(output_qty):.0f}，"
-                            f"报废 {float(scrap_qty):.0f}。"
-                        )
+                        cursor.execute("""
+                            UPDATE production_measurement
+                            SET quality_status = COALESCE(quality_status, 'Pending'),
+                                release_status = CASE
+                                    WHEN lower(COALESCE(release_status, 'pending')) = 'released'
+                                    THEN release_status
+                                    ELSE 'pending'
+                                END,
+                                qc_before_qty = ?,
+                                qc_note = COALESCE(qc_note, '') || '；生产完成自动同步半成品仓数量'
+                            WHERE production_batch_id = ?
+                        """, (
+                            float(output_qty),
+                            int(batch_id)
+                        ))
 
-                    st.rerun()
+                conn.commit()
 
-                except Exception as e:
-                    conn.rollback()
-                    st.error(f"生产过程记录提交失败：{e}")
-                    return
+                # =========================
+                # 调用已有自动质检同步函数
+                # 如果你已有这个函数，保留自动补强
+                # =========================
+                if final_step_done and "auto_create_qc_after_production_done" in globals():
+                    try:
+                        auto_create_qc_after_production_done(conn, int(batch_id))
+                    except Exception:
+                        pass
+
+                # =========================
+                # 统一同步交付批次
+                # =========================
+                if pd.notna(selected["delivery_plan_id"]):
+                    if "sync_after_delivery_plan_change" in globals():
+                        try:
+                            sync_after_delivery_plan_change(
+                                conn,
+                                int(selected["delivery_plan_id"])
+                            )
+                        except Exception:
+                            pass
+
+                st.cache_data.clear()
+
+                if final_step_done:
+                    st.success(
+                        "生产路线最后一道工序已完成，系统已自动同步："
+                        "半成品仓数量、质检前数量，并将交付状态推进到【质检中】。"
+                    )
+                else:
+                    st.success("生产过程记录已写入，批次状态已更新。")
+
+                st.session_state["_next_process_entry_section"] = "① 生产任务卡"
+                st.rerun()
+
+            except sqlite3.OperationalError as e:
+                conn.rollback()
+
+                if "database is locked" in str(e).lower():
+                    st.error("数据库当前被锁定。请停止其他正在运行的 Streamlit 进程后重新提交。")
+                else:
+                    st.error(f"生产过程提交失败：{e}")
+
+            except Exception as e:
+                conn.rollback()
+                st.error(f"生产过程提交失败：{e}")
 
     # =========================
-    # 8. 当前批次工序记录
+    # 8. 工序记录
     # =========================
     elif section == "③ 工序记录":
         st.subheader("当前批次工序记录")
@@ -9938,14 +10071,20 @@ def page_production_process_entry(conn):
         if current_log_df.empty:
             st.info("当前批次还没有任何生产过程日志。")
         else:
-            show_df(current_log_df.sort_values("process_log_id"), hide_index=True)
-
-        st.markdown("---")
-
-        s1, s2, s3 = st.columns(3)
-        s1.metric("累计投入", f"{float(total_input_qty):.0f}")
-        s2.metric("累计产出", f"{float(total_output_qty):.0f}")
-        s3.metric("累计报废", f"{float(total_scrap_qty):.0f}")
+            show_df(current_log_df.rename(columns={
+                "process_log_id": "过程日志编号",
+                "production_batch_id": "生产批次编号",
+                "process_step": "工序",
+                "equipment_code": "设备编号",
+                "operator_name": "操作员",
+                "input_qty": "投入数量",
+                "output_qty": "产出数量",
+                "scrap_qty": "报废数量",
+                "process_status": "工序状态",
+                "start_time": "开始时间",
+                "end_time": "结束时间",
+                "remark": "备注",
+            }), hide_index=True)
 
     # =========================
     # 9. 所有生产过程日志
@@ -9961,9 +10100,9 @@ def page_production_process_entry(conn):
             ppl.process_step,
             ppl.equipment_code,
             ppl.operator_name,
-            ppl.input_qty,
-            ppl.output_qty,
-            ppl.scrap_qty,
+            COALESCE(ppl.input_qty, 0) AS input_qty,
+            COALESCE(ppl.output_qty, 0) AS output_qty,
+            COALESCE(ppl.scrap_qty, 0) AS scrap_qty,
             ppl.process_status,
             ppl.start_time,
             ppl.end_time,
@@ -9972,13 +10111,27 @@ def page_production_process_entry(conn):
         JOIN production_batch pb
             ON ppl.production_batch_id = pb.production_batch_id
         ORDER BY ppl.process_log_id DESC
+        LIMIT 200
     """, conn)
 
     if all_log_df.empty:
         st.info("当前还没有任何生产过程日志。")
     else:
-        show_df(all_log_df, hide_index=True)
-
+        show_df(all_log_df.rename(columns={
+            "process_log_id": "过程日志编号",
+            "batch_code": "生产批号",
+            "production_batch_id": "生产批次编号",
+            "process_step": "工序",
+            "equipment_code": "设备编号",
+            "operator_name": "操作员",
+            "input_qty": "投入数量",
+            "output_qty": "产出数量",
+            "scrap_qty": "报废数量",
+            "process_status": "工序状态",
+            "start_time": "开始时间",
+            "end_time": "结束时间",
+            "remark": "备注",
+        }), hide_index=True)
 
 def adjust_spec_inventory_lot(conn, inventory_lot_id, adjust_type, adjust_qty, adjust_reason, adjust_note):
     """
@@ -12266,16 +12419,32 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
     shipment_cols = pd.read_sql_query(
         "PRAGMA table_info(shipment)",
         conn
+
     )["name"].tolist()
 
     shipment_data = {
         "shipment_no": shipment_no,
+        "customer_id": int(plan["customer_id"]) if pd.notna(plan["customer_id"]) else None,
+        "order_id": int(order_id),
+        "order_item_id": int(order_item_id),
+        "delivery_plan_id": int(delivery_plan_id),
         "ship_date": ship_date,
+        "shipment_date": ship_date,
         "carrier": normalize_text(carrier) or "SF Express",
         "destination": normalize_text(destination) or "Customer Warehouse",
+        "recipient": normalize_text(destination) or "Customer Warehouse",
         "created_by": normalize_text(created_by) or "Shipment User",
+        "operator_name": normalize_text(created_by) or "Shipment User",
         "shipment_status": "completed",
+        "status": "completed",
+
         "notes": (
+            f"按交付批次 {delivery_plan_id} 出货；"
+            f"PO={plan['po_no']}；"
+            f"客户={plan['customer_name']}"
+        ),
+
+        "remark": (
             f"按交付批次 {delivery_plan_id} 出货；"
             f"PO={plan['po_no']}；"
             f"客户={plan['customer_name']}"
@@ -12285,7 +12454,33 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
     shipment_insert_cols = [
         c for c in shipment_data.keys()
         if c in shipment_cols
+
     ]
+    shipment_required_missing = []
+    table_info_df = pd.read_sql_query(
+        "PRAGMA table_info(shipment)",
+        conn
+    )
+
+    for _, col_row in table_info_df.iterrows():
+        col_name = col_row["name"]
+        notnull = int(col_row["notnull"] or 0)
+        has_default = pd.notna(col_row["dflt_value"])
+
+        if (
+            notnull == 1
+            and has_default is False
+            and col_name not in shipment_insert_cols
+            and col_name not in ["shipment_id", "id"]
+
+        ):
+            shipment_required_missing.append(col_name)
+
+    if shipment_required_missing:
+        return False, (
+            "shipment 表存在必填字段，但当前出货函数未赋值："
+            + "、".join(shipment_required_missing)
+        )
 
     shipment_placeholders = ", ".join(["?"] * len(shipment_insert_cols))
     shipment_col_sql = ", ".join(shipment_insert_cols)
@@ -20298,7 +20493,7 @@ def main():
         page_outbound_tracking_center(conn)
 
     elif page == "出货管理":
-        page_shipment(conn)
+        page_shipment_management(conn)
 
     elif page == "实时刷新查询":
         page_realtime_query(conn)
