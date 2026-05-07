@@ -15531,239 +15531,835 @@ def find_or_create_spec_stock_lot(
         conn.rollback()
         return False, f"退货再上架失败：{e}"
 
-
 def page_return_restock_to_spec_inventory(conn):
     """
-    退货再上架页面：
-    将退回产品按 产品规格 + 特殊工艺 + 材质 进入 WH-SPEC 规格化库存。
+    退货处理 / 再上架页面
+
+    新流程：
+    1. 订单来源查询：输入 PO / Trace Key / 生产批号 / 出货单号
+    2. 选择原始记录：显示订单、客户、规格、工艺、材质、批次、出货、库存信息
+    3. 选择退货处理方式：
+       - 规格化再上架 WH-SPEC
+       - 回原订单库存 WH-ORDER
+       - 暂存待检 RETURN-HOLD
+    4. 确认退货数量：
+       - 退货数量上限 = 该来源出货数量 - 已累计退货数量
+       - 自动写入目标库存池
+       - 自动写入 inventory_transaction_log
+       - 自动写入 return_restock_log
     """
 
-    st.header("仓储｜退货再上架")
+    st.header("仓储｜退货处理 / 再上架")
 
     st.info(
-        "退货再上架不会回到原订单库存，而是按【产品规格 + 特殊工艺 + 材质】"
-        "进入 WH-SPEC 规格化库存池。"
-        "这样后续销售可以按规格整体检索，再用特殊工艺和材质精确匹配。"
+        "退货处理应先通过 PO / Trace Key / 生产批号 / 出货单号锁定原始货物来源，"
+        "再决定进入 WH-SPEC 规格化库存、回原订单库存 WH-ORDER，或进入 RETURN-HOLD 暂存待检。"
+        "系统会自动限制累计退货数量不能超过该来源记录的实际出货数量。"
     )
 
-    # =========================
-    # 1. 读取产品规格
-    # =========================
-    spec_df = pd.read_sql_query("""
-        SELECT
-            ps.spec_id,
-            ps.spec_code,
-            ps.spec_desc,
-            ps.outer_diameter_mm,
-            ps.wall_thickness_mm,
-            ps.length_mm,
-            p.product_id,
-            p.product_name,
-            p.product_code
-        FROM product_spec ps
-        JOIN product p
-            ON ps.product_id = p.product_id
-        WHERE COALESCE(ps.is_enabled, 1) = 1
-          AND COALESCE(p.is_enabled, 1) = 1
-        ORDER BY p.product_name, ps.spec_code
-    """, conn)
+    # =====================================================
+    # 内部安全函数
+    # =====================================================
+    def _text(v, default=""):
+        try:
+            value = normalize_text(v)
+        except Exception:
+            value = "" if v is None else str(v).strip()
+        return value if value else default
 
-    if spec_df.empty:
-        st.error("当前没有启用的产品规格，请先在【基础选项管理 → 产品规格管理】维护产品规格。")
+    def _float(v, default=0.0):
+        try:
+            if pd.isna(v):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    def _int(v, default=None):
+        try:
+            if pd.isna(v):
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    def _now_code():
+        return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def _make_return_hold_key(trace_key):
+        base = _text(trace_key, _now_code())
+        return f"RETURN_HOLD__{base}"
+
+    def _make_order_trace_key_from_row(row):
+        trace_key = _text(row.get("trace_key"))
+        if trace_key:
+            return trace_key
+
+        return build_trace_key(
+            po_no=row.get("po_no"),
+            spec_code=row.get("spec_code"),
+            special_process=row.get("special_process"),
+            material=row.get("material")
+        )
+
+    def _make_spec_stock_key_from_row(row):
+        return build_spec_stock_group_key(
+            _text(row.get("spec_code"), "UNKNOWN_SPEC"),
+            _text(row.get("special_process"), "STANDARD"),
+            _text(row.get("material"), "UNKNOWN_MATERIAL")
+        )
+
+    def _ensure_return_log_table():
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS return_restock_log (
+                return_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_order_item_id INTEGER,
+                source_order_id INTEGER,
+                source_customer_id INTEGER,
+                source_delivery_plan_id INTEGER,
+                source_production_batch_id INTEGER,
+                source_inventory_lot_id INTEGER,
+                source_shipment_id INTEGER,
+                po_no TEXT,
+                trace_key TEXT,
+                return_mode TEXT,
+                target_inventory_lot_id INTEGER,
+                return_qty REAL,
+                operator_name TEXT,
+                reference_no TEXT,
+                return_reason TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def _insert_inventory_txn(lot_id, txn_type, qty, reason, reference_no):
+        conn.execute("""
+            INSERT INTO inventory_transaction_log (
+                inventory_lot_id,
+                txn_type,
+                qty,
+                txn_time,
+                txn_reason,
+                reference_no
+            ) VALUES (?, ?, ?, datetime('now'), ?, ?)
+        """, (
+            int(lot_id),
+            txn_type,
+            float(qty),
+            _text(reason),
+            _text(reference_no)
+        ))
+
+    def _insert_return_log(source_row, return_mode, lot_id, qty, operator_name, reference_no, reason):
+        _ensure_return_log_table()
+
+        conn.execute("""
+            INSERT INTO return_restock_log (
+                source_order_item_id,
+                source_order_id,
+                source_customer_id,
+                source_delivery_plan_id,
+                source_production_batch_id,
+                source_inventory_lot_id,
+                source_shipment_id,
+                po_no,
+                trace_key,
+                return_mode,
+                target_inventory_lot_id,
+                return_qty,
+                operator_name,
+                reference_no,
+                return_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _int(source_row.get("order_item_id")),
+            _int(source_row.get("order_id")),
+            _int(source_row.get("customer_id")),
+            _int(source_row.get("delivery_plan_id")),
+            _int(source_row.get("production_batch_id")),
+            _int(source_row.get("inventory_lot_id")),
+            _int(source_row.get("shipment_id")),
+            _text(source_row.get("po_no")),
+            _text(source_row.get("trace_key")),
+            _text(return_mode),
+            _int(lot_id),
+            float(qty),
+            _text(operator_name),
+            _text(reference_no),
+            _text(reason)
+        ))
+
+    def _get_already_returned_qty(source_row):
+        """
+        计算当前来源记录已经累计退货的数量。
+
+        优先级：
+        1. shipment_id + order_item_id
+        2. trace_key + order_item_id
+        3. po_no + trace_key
+        """
+
+        _ensure_return_log_table()
+
+        shipment_id = _int(source_row.get("shipment_id"))
+        order_item_id = _int(source_row.get("order_item_id"))
+        trace_key = _text(source_row.get("trace_key"))
+        po_no = _text(source_row.get("po_no"))
+
+        if shipment_id is not None and order_item_id is not None:
+            df = pd.read_sql_query("""
+                SELECT COALESCE(SUM(return_qty), 0) AS returned_qty
+                FROM return_restock_log
+                WHERE source_shipment_id = ?
+                  AND source_order_item_id = ?
+            """, conn, params=[shipment_id, order_item_id])
+
+            return _float(df.iloc[0]["returned_qty"])
+
+        if trace_key and order_item_id is not None:
+            df = pd.read_sql_query("""
+                SELECT COALESCE(SUM(return_qty), 0) AS returned_qty
+                FROM return_restock_log
+                WHERE trace_key = ?
+                  AND source_order_item_id = ?
+            """, conn, params=[trace_key, order_item_id])
+
+            return _float(df.iloc[0]["returned_qty"])
+
+        if po_no and trace_key:
+            df = pd.read_sql_query("""
+                SELECT COALESCE(SUM(return_qty), 0) AS returned_qty
+                FROM return_restock_log
+                WHERE po_no = ?
+                  AND trace_key = ?
+            """, conn, params=[po_no, trace_key])
+
+            return _float(df.iloc[0]["returned_qty"])
+
+        return 0.0
+
+    def _return_to_spec_stock(source_row, qty, operator_name, reference_no, reason):
+        """
+        规格化再上架 WH-SPEC：
+        按 产品规格 + 特殊工艺 + 材质 进入规格化库存池。
+        """
+
+        product_id = _int(source_row.get("product_id"))
+        spec_id = _int(source_row.get("spec_id"))
+        spec_code = _text(source_row.get("spec_code"))
+        special_process = _text(source_row.get("special_process"), "STANDARD").upper()
+        material = _text(source_row.get("material"), "UNKNOWN_MATERIAL").upper()
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能进入 WH-SPEC。", None
+
+        if not spec_code:
+            return False, "无法识别规格编码，不能进入 WH-SPEC。", None
+
+        if not material or material == "UNKNOWN_MATERIAL":
+            return False, "无法识别材质，不能进入 WH-SPEC。请先确认原订单或批次材质。", None
+
+        spec_stock_key = build_spec_stock_group_key(
+            spec_code,
+            special_process,
+            material
+        )
+
+        lot_df = pd.read_sql_query("""
+            SELECT
+                inventory_lot_id,
+                available_qty
+            FROM inventory_lot
+            WHERE location = 'WH-SPEC'
+              AND spec_id = ?
+              AND trace_key = ?
+              AND COALESCE(lot_status, 'available') IN ('available', 'partial')
+              AND COALESCE(release_status, 'released') = 'released'
+            ORDER BY inventory_lot_id
+            LIMIT 1
+        """, conn, params=[
+            int(spec_id),
+            spec_stock_key
+        ])
+
+        if lot_df.empty:
+            lot_code = (
+                "LOT-SPEC-"
+                + normalize_trace_part(spec_code, "NOSPEC")
+                + "-"
+                + normalize_trace_part(special_process, "STANDARD")
+                + "-"
+                + normalize_trace_part(material, "UNKNOWN_MATERIAL")
+                + "-"
+                + _now_code()
+            )
+
+            conn.execute("""
+                INSERT INTO inventory_lot (
+                    product_id,
+                    spec_id,
+                    production_batch_id,
+                    trace_key,
+                    lot_code,
+                    location,
+                    available_qty,
+                    reserved_qty,
+                    lot_status,
+                    release_status,
+                    exclusive_customer,
+                    forbidden_customer
+                ) VALUES (?, ?, NULL, ?, ?, 'WH-SPEC', ?, 0, 'available', 'released', '', '')
+            """, (
+                int(product_id),
+                int(spec_id),
+                spec_stock_key,
+                lot_code,
+                float(qty)
+            ))
+
+            lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        else:
+            lot_id = int(lot_df.iloc[0]["inventory_lot_id"])
+
+            conn.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) + ?,
+                    lot_status = 'available',
+                    release_status = 'released'
+                WHERE inventory_lot_id = ?
+            """, (
+                float(qty),
+                int(lot_id)
+            ))
+
+        _insert_inventory_txn(
+            lot_id=lot_id,
+            txn_type="RETURN_TO_SPEC_STOCK",
+            qty=qty,
+            reason=reason or "退货规格化再上架 WH-SPEC",
+            reference_no=reference_no
+        )
+
+        return True, "退货已规格化处理并进入 WH-SPEC。", lot_id
+
+    def _return_to_order_stock(source_row, qty, operator_name, reference_no, reason):
+        """
+        回原订单库存 WH-ORDER：
+        按原 Trace Key 回到订单库存。
+        """
+
+        product_id = _int(source_row.get("product_id"))
+        spec_id = _int(source_row.get("spec_id"))
+        production_batch_id = _int(source_row.get("production_batch_id"))
+        trace_key = _make_order_trace_key_from_row(source_row)
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能回原订单库存。", None
+
+        if not trace_key:
+            return False, "无法识别原订单 Trace Key，不能回原订单库存。", None
+
+        lot_df = pd.read_sql_query("""
+            SELECT
+                inventory_lot_id,
+                available_qty
+            FROM inventory_lot
+            WHERE location = 'WH-ORDER'
+              AND trace_key = ?
+              AND COALESCE(lot_status, 'available') IN ('available', 'partial', 'hold', 'depleted')
+            ORDER BY inventory_lot_id
+            LIMIT 1
+        """, conn, params=[trace_key])
+
+        if lot_df.empty:
+            lot_code = "LOT-ORDER-RETURN-" + _now_code()
+
+            conn.execute("""
+                INSERT INTO inventory_lot (
+                    product_id,
+                    spec_id,
+                    production_batch_id,
+                    trace_key,
+                    lot_code,
+                    location,
+                    available_qty,
+                    reserved_qty,
+                    lot_status,
+                    release_status,
+                    exclusive_customer,
+                    forbidden_customer
+                ) VALUES (?, ?, ?, ?, ?, 'WH-ORDER', ?, 0, 'available', 'released', ?, '')
+            """, (
+                int(product_id),
+                int(spec_id),
+                production_batch_id,
+                trace_key,
+                lot_code,
+                float(qty),
+                _text(source_row.get("customer_name"))
+            ))
+
+            lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        else:
+            lot_id = int(lot_df.iloc[0]["inventory_lot_id"])
+
+            conn.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) + ?,
+                    lot_status = 'available',
+                    release_status = 'released'
+                WHERE inventory_lot_id = ?
+            """, (
+                float(qty),
+                int(lot_id)
+            ))
+
+        _insert_inventory_txn(
+            lot_id=lot_id,
+            txn_type="RETURN_TO_ORDER_STOCK",
+            qty=qty,
+            reason=reason or "退货回原订单库存 WH-ORDER",
+            reference_no=reference_no
+        )
+
+        return True, "退货已回到原订单库存 WH-ORDER。", lot_id
+
+    def _return_to_hold(source_row, qty, operator_name, reference_no, reason):
+        """
+        暂存待检 RETURN-HOLD：
+        暂不进入可销售库存。
+        """
+
+        product_id = _int(source_row.get("product_id"))
+        spec_id = _int(source_row.get("spec_id"))
+        production_batch_id = _int(source_row.get("production_batch_id"))
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能进入 RETURN-HOLD。", None
+
+        hold_key = _make_return_hold_key(source_row.get("trace_key"))
+        lot_code = "LOT-RETURN-HOLD-" + _now_code()
+
+        conn.execute("""
+            INSERT INTO inventory_lot (
+                product_id,
+                spec_id,
+                production_batch_id,
+                trace_key,
+                lot_code,
+                location,
+                available_qty,
+                reserved_qty,
+                lot_status,
+                release_status,
+                exclusive_customer,
+                forbidden_customer
+            ) VALUES (?, ?, ?, ?, ?, 'RETURN-HOLD', ?, 0, 'hold', 'pending', '', '')
+        """, (
+            int(product_id),
+            int(spec_id),
+            production_batch_id,
+            hold_key,
+            lot_code,
+            float(qty)
+        ))
+
+        lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        _insert_inventory_txn(
+            lot_id=lot_id,
+            txn_type="RETURN_HOLD",
+            qty=qty,
+            reason=reason or "退货暂存待检 RETURN-HOLD",
+            reference_no=reference_no
+        )
+
+        return True, "退货已进入 RETURN-HOLD 暂存待检。", lot_id
+
+    # =====================================================
+    # 第一步：订单来源查询
+    # =====================================================
+    st.subheader("第一步：订单来源查询")
+
+    search_keyword = st.text_input(
+        "输入 PO / Trace Key / 生产批号 / 出货单号",
+        value="",
+        placeholder="例如：135246、135246__TUO-1703__CHAMFER__SODA-LIME、BATCH-135246-1、SHP-202605..."
+    )
+
+    source_df = pd.DataFrame()
+
+    if _text(search_keyword):
+        kw = f"%{_text(search_keyword)}%"
+
+        source_df = pd.read_sql_query("""
+            SELECT DISTINCT
+                oi.order_item_id,
+                o.order_id,
+                c.customer_id,
+                c.customer_name,
+
+                oi.po_no,
+                oi.customer_pn,
+                oi.product_id,
+                oi.spec_id,
+                oi.product_type_text,
+                oi.product_spec_text,
+                COALESCE(pspec.spec_code, oi.product_spec_text) AS spec_code,
+                COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS special_process,
+                COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS material,
+                oi.trace_key,
+
+                COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+                COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
+
+                dp.delivery_plan_id,
+                COALESCE(dp.delivery_batch_no, 1) AS delivery_batch_no,
+                COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
+                COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
+                COALESCE(dp.delivery_status, '未排产') AS delivery_status,
+
+                pb.production_batch_id,
+                pb.batch_code,
+                COALESCE(pb.required_production_qty, 0) AS required_production_qty,
+                COALESCE(pb.actual_qty, 0) AS batch_actual_qty,
+                COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+                COALESCE(pb.finished_wh_qty, 0) AS finished_wh_qty,
+                COALESCE(pb.production_flow_status, '') AS production_flow_status,
+
+                il.inventory_lot_id,
+                il.lot_code,
+                il.location,
+                COALESCE(il.available_qty, 0) AS available_qty,
+                COALESCE(il.reserved_qty, 0) AS reserved_qty,
+                COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
+                COALESCE(il.lot_status, '') AS lot_status,
+                COALESCE(il.release_status, '') AS release_status,
+
+                s.shipment_id,
+                s.shipment_no,
+                s.ship_date,
+                s.carrier,
+                s.destination,
+                s.shipment_status,
+                COALESCE(si.shipped_qty, 0) AS shipment_item_qty
+
+            FROM order_item oi
+            LEFT JOIN orders o
+                ON oi.order_id = o.order_id
+            LEFT JOIN customer c
+                ON o.customer_id = c.customer_id
+            LEFT JOIN product_spec pspec
+                ON oi.spec_id = pspec.spec_id
+            LEFT JOIN delivery_plan dp
+                ON oi.order_item_id = dp.order_item_id
+            LEFT JOIN production_schedule psch
+                ON dp.delivery_plan_id = psch.delivery_plan_id
+                OR oi.order_item_id = psch.order_item_id
+            LEFT JOIN production_batch pb
+                ON psch.production_batch_id = pb.production_batch_id
+            LEFT JOIN inventory_lot il
+                ON il.production_batch_id = pb.production_batch_id
+                OR il.trace_key = oi.trace_key
+            LEFT JOIN shipment_item si
+                ON si.order_item_id = oi.order_item_id
+                OR si.trace_key = oi.trace_key
+                OR si.inventory_lot_id = il.inventory_lot_id
+            LEFT JOIN shipment s
+                ON si.shipment_id = s.shipment_id
+
+            WHERE
+                   oi.po_no LIKE ?
+                OR oi.trace_key LIKE ?
+                OR pb.batch_code LIKE ?
+                OR s.shipment_no LIKE ?
+                OR il.lot_code LIKE ?
+                OR c.customer_name LIKE ?
+
+            ORDER BY
+                oi.order_item_id DESC,
+                dp.delivery_plan_id DESC,
+                pb.production_batch_id DESC,
+                il.inventory_lot_id DESC,
+                s.shipment_id DESC
+        """, conn, params=[kw, kw, kw, kw, kw, kw])
+
+    if _text(search_keyword) and source_df.empty:
+        st.warning("没有查询到相关订单 / 批次 / 出货记录，请检查输入内容。")
+
+    if source_df.empty:
+        st.info("请先输入 PO / Trace Key / 生产批号 / 出货单号进行来源查询。")
         return
 
-    # =========================
-    # 2. 读取特殊工艺 / 材质
-    # =========================
-    if "get_business_options" in globals():
-        special_process_options = get_business_options(
-            conn,
-            "special_process",
-            ["STANDARD", "LASER", "CHAMFER", "DRILLING"]
-        )
+    st.success(f"查询到 {len(source_df)} 条相关来源记录。")
 
-        material_options = get_business_options(
-            conn,
-            "material",
-            ["BOROSILICATE", "QUARTZ", "SODA-LIME"]
-        )
-    else:
-        special_process_options = ["STANDARD", "LASER", "CHAMFER", "DRILLING"]
-        material_options = ["BOROSILICATE", "QUARTZ", "SODA-LIME"]
+    preview_cols = [
+        "customer_name",
+        "po_no",
+        "product_type_text",
+        "product_spec_text",
+        "spec_code",
+        "special_process",
+        "material",
+        "trace_key",
+        "delivery_batch_no",
+        "delivery_status",
+        "batch_code",
+        "location",
+        "available_qty",
+        "lot_total_qty",
+        "shipment_no",
+        "shipment_item_qty",
+    ]
 
-    st.markdown("### 退货产品信息")
+    existing_preview_cols = [c for c in preview_cols if c in source_df.columns]
 
-    c1, c2, c3 = st.columns(3)
+    show_df(source_df[existing_preview_cols].rename(columns={
+        "customer_name": "客户",
+        "po_no": "PO",
+        "product_type_text": "产品",
+        "product_spec_text": "规格文本",
+        "spec_code": "规格编码",
+        "special_process": "特殊工艺",
+        "material": "材质",
+        "trace_key": "Trace Key",
+        "delivery_batch_no": "交付批次",
+        "delivery_status": "交付状态",
+        "batch_code": "生产批号",
+        "location": "库存位置",
+        "available_qty": "可用数量",
+        "lot_total_qty": "Lot总数量",
+        "shipment_no": "出货单号",
+        "shipment_item_qty": "出货数量",
+    }), hide_index=True)
 
-    with c1:
-        selected_spec_id = st.selectbox(
-            "产品规格",
-            spec_df["spec_id"].tolist(),
-            format_func=lambda x: (
-                f"{spec_df.loc[spec_df['spec_id'] == x, 'product_name'].iloc[0]}"
-                f"｜{spec_df.loc[spec_df['spec_id'] == x, 'spec_code'].iloc[0]}"
-            ),
-            key="return_restock_spec_id"
-        )
-
-    selected_spec = spec_df[spec_df["spec_id"] == selected_spec_id].iloc[0]
-
-    with c2:
-        special_process = st.selectbox(
-            "特殊工艺",
-            special_process_options,
-            index=0,
-            key="return_restock_special_process"
-        )
-
-    with c3:
-        material = st.selectbox(
-            "材质",
-            material_options,
-            index=0,
-            key="return_restock_material"
-        )
-
-    spec_code = normalize_text(selected_spec["spec_code"]).upper()
-    product_id = int(selected_spec["product_id"])
-    spec_id = int(selected_spec["spec_id"])
-
-    st.caption(
-        f"产品：{selected_spec['product_name']} ｜ "
-        f"规格编码：{selected_spec['spec_code']} ｜ "
-        f"规格描述：{selected_spec['spec_desc']} ｜ "
-        f"外径：{selected_spec['outer_diameter_mm']} mm ｜ "
-        f"壁厚：{selected_spec['wall_thickness_mm']} mm ｜ "
-        f"长度：{selected_spec['length_mm']} mm"
-    )
-
-    spec_stock_key = get_spec_stock_key_for_inventory(
-        spec_code=spec_code,
-        special_process=special_process,
-        material=material
-    )
-
-    st.markdown("### 将进入的规格化库存池")
-    st.code(spec_stock_key)
-
-    # =========================
-    # 3. 当前库存池现有数量
-    # =========================
-    current_pool_df = pd.read_sql_query("""
-        SELECT
-            inventory_lot_id,
-            lot_code,
-            location,
-            available_qty,
-            reserved_qty,
-            COALESCE(available_qty, 0) + COALESCE(reserved_qty, 0) AS total_qty,
-            lot_status,
-            release_status,
-            trace_key
-        FROM inventory_lot
-        WHERE location = 'WH-SPEC'
-          AND spec_id = ?
-          AND trace_key = ?
-        ORDER BY inventory_lot_id
-    """, conn, params=[
-        int(spec_id),
-        spec_stock_key
-    ])
-
-    if current_pool_df.empty:
-        st.warning("当前规格 + 特殊工艺 + 材质还没有规格化库存 Lot，本次上架将自动创建。")
-        current_available_qty = 0.0
-    else:
-        current_available_qty = pd.to_numeric(
-            current_pool_df["available_qty"],
-            errors="coerce"
-        ).fillna(0).sum()
-
-        st.success(f"当前库存池已有可用数量：{current_available_qty:.0f}")
-
-        with st.expander("查看当前库存池 Lot", expanded=False):
-            show_df(current_pool_df.rename(columns={
-                "inventory_lot_id": "Lot编号",
-                "lot_code": "Lot号",
-                "location": "库位",
-                "available_qty": "可用数量",
-                "reserved_qty": "预留数量",
-                "total_qty": "总数量",
-                "lot_status": "Lot状态",
-                "release_status": "放行状态",
-                "trace_key": "规格化库存Key"
-            }), hide_index=True)
-
-    # =========================
-    # 4. 上架表单
-    # =========================
+    # =====================================================
+    # 第二步：选择原始记录
+    # =====================================================
     st.markdown("---")
-    st.markdown("### 退货再上架录入")
+    st.subheader("第二步：选择原始记录")
 
-    with st.form("return_restock_to_spec_inventory_form"):
-        r1, r2, r3 = st.columns(3)
+    source_df = source_df.reset_index(drop=True)
 
-        with r1:
+    source_df["source_option_label"] = source_df.apply(
+        lambda r: (
+            f"PO {r.get('po_no', '')} | "
+            f"客户 {r.get('customer_name', '')} | "
+            f"规格 {r.get('spec_code', '') or r.get('product_spec_text', '')} | "
+            f"{r.get('special_process', '')} / {r.get('material', '')} | "
+            f"批次 {r.get('batch_code', '') or '-'} | "
+            f"Lot {r.get('lot_code', '') or '-'} | "
+            f"出货单 {r.get('shipment_no', '') or '-'}"
+        ),
+        axis=1
+    )
+
+    selected_idx = st.selectbox(
+        "选择要处理的原始来源记录",
+        source_df.index.tolist(),
+        format_func=lambda i: source_df.loc[i, "source_option_label"],
+        key="return_source_record_select"
+    )
+
+    selected = source_df.loc[selected_idx].copy()
+
+    st.markdown("#### 原始记录信息")
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("客户", _text(selected.get("customer_name"), "-"))
+    a2.metric("PO", _text(selected.get("po_no"), "-"))
+    a3.metric("交付批次", f"第 {_int(selected.get('delivery_batch_no'), 1)} 批")
+    a4.metric("交付状态", _text(selected.get("delivery_status"), "-"))
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("产品", _text(selected.get("product_type_text"), "-"))
+    b2.metric("规格", _text(selected.get("spec_code")) or _text(selected.get("product_spec_text"), "-"))
+    b3.metric("特殊工艺", _text(selected.get("special_process"), "STANDARD"))
+    b4.metric("材质", _text(selected.get("material"), "UNKNOWN_MATERIAL"))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("生产批号", _text(selected.get("batch_code"), "-"))
+    c2.metric("库存位置", _text(selected.get("location"), "-"))
+    c3.metric("当前可用库存", f"{_float(selected.get('available_qty')):.0f}")
+    c4.metric("已出货数量", f"{_float(selected.get('shipment_item_qty')):.0f}")
+
+    st.markdown("Trace Key")
+    st.code(_text(selected.get("trace_key"), "-"))
+
+    # =====================================================
+    # 第三步：退货处理方式
+    # =====================================================
+    st.markdown("---")
+    st.subheader("第三步：选择退货处理方式")
+
+    return_mode = st.radio(
+        "退货处理方式",
+        [
+            "规格化再上架 WH-SPEC",
+            "回原订单库存 WH-ORDER",
+            "暂存待检 RETURN-HOLD",
+        ],
+        horizontal=True,
+        key="return_process_mode"
+    )
+
+    if return_mode == "规格化再上架 WH-SPEC":
+        spec_key = _make_spec_stock_key_from_row(selected)
+        st.success("本次退货将规格化处理后进入 WH-SPEC。")
+        st.markdown("将进入的规格化库存池")
+        st.code(spec_key)
+
+    elif return_mode == "回原订单库存 WH-ORDER":
+        order_key = _make_order_trace_key_from_row(selected)
+        st.success("本次退货将回到原订单库存 WH-ORDER。")
+        st.markdown("将回到的订单 Trace Key")
+        st.code(order_key)
+
+    else:
+        hold_key = _make_return_hold_key(selected.get("trace_key"))
+        st.warning("本次退货将暂存待检，不进入可销售库存。")
+        st.markdown("暂存待检 Key")
+        st.code(hold_key)
+
+    # =====================================================
+    # 第四步：确认退货数量
+    # =====================================================
+    st.markdown("---")
+    st.subheader("第四步：确认退货数量")
+
+    shipped_qty = _float(selected.get("shipment_item_qty"))
+    already_returned_qty = _get_already_returned_qty(selected)
+    remaining_returnable_qty = max(shipped_qty - already_returned_qty, 0.0)
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("该来源出货数量", f"{shipped_qty:.0f}")
+    r2.metric("已累计退货数量", f"{already_returned_qty:.0f}")
+    r3.metric("剩余可退数量", f"{remaining_returnable_qty:.0f}")
+
+    if shipped_qty <= 0:
+        st.error("当前来源记录没有出货数量，不能执行退货。请先选择有出货记录的来源。")
+        return
+
+    if remaining_returnable_qty <= 0:
+        st.error("该来源记录已全部退完，不能继续退货。")
+        return
+
+    default_qty = min(1.0, remaining_returnable_qty)
+
+    with st.form("return_process_confirm_form"):
+        q1, q2, q3 = st.columns(3)
+
+        with q1:
             return_qty = st.number_input(
-                "退货再上架数量",
-                min_value=1.0,
-                value=1.0,
+                "退货数量",
+                min_value=0.0,
+                max_value=float(remaining_returnable_qty),
+                value=float(default_qty),
                 step=1.0,
-                key="return_restock_qty"
+                help="退货数量不能超过该来源记录的剩余可退数量。"
             )
 
-        with r2:
+        with q2:
             operator_name = st.text_input(
                 "操作人",
-                value="Warehouse User",
-                key="return_restock_operator"
+                value="Warehouse User"
             )
 
-        with r3:
-            source_ref = st.text_input(
+        with q3:
+            reference_no = st.text_input(
                 "参考单号 / 退货单号",
-                value=f"RETURN-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                key="return_restock_source_ref"
+                value=f"RETURN-{_now_code()}"
             )
 
-        reason = st.text_area(
+        return_reason = st.text_area(
             "退货 / 再上架原因",
-            value="客户退货再上架至规格化库存",
-            key="return_restock_reason"
+            value=""
         )
 
-        submitted = st.form_submit_button("确认退货再上架")
+        submitted = st.form_submit_button("确认退货处理")
 
     if submitted:
-        ok, msg = find_or_create_spec_stock_lot(
-            conn=conn,
-            product_id=product_id,
-            spec_id=spec_id,
-            spec_code=spec_code,
-            special_process=special_process,
-            material=material,
-            qty=float(return_qty),
-            reason=reason,
-            operator_name=operator_name,
-            source_ref=source_ref
-        )
+        if float(return_qty or 0) <= 0:
+            st.error("退货数量必须大于 0。")
+            return
 
-        if ok:
+        if float(return_qty) > remaining_returnable_qty:
+            st.error(
+                f"退货数量不能大于剩余可退数量：{remaining_returnable_qty:.0f}。"
+                f"该来源出货数量为 {shipped_qty:.0f}，"
+                f"已累计退货 {already_returned_qty:.0f}。"
+            )
+            return
+
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+            if return_mode == "规格化再上架 WH-SPEC":
+                ok, msg, lot_id = _return_to_spec_stock(
+                    selected,
+                    float(return_qty),
+                    operator_name,
+                    reference_no,
+                    return_reason
+                )
+
+            elif return_mode == "回原订单库存 WH-ORDER":
+                ok, msg, lot_id = _return_to_order_stock(
+                    selected,
+                    float(return_qty),
+                    operator_name,
+                    reference_no,
+                    return_reason
+                )
+
+            else:
+                ok, msg, lot_id = _return_to_hold(
+                    selected,
+                    float(return_qty),
+                    operator_name,
+                    reference_no,
+                    return_reason
+                )
+
+            if not ok:
+                conn.rollback()
+                st.error(msg)
+                return
+
+            _insert_return_log(
+                source_row=selected,
+                return_mode=return_mode,
+                lot_id=lot_id,
+                qty=float(return_qty),
+                operator_name=operator_name,
+                reference_no=reference_no,
+                reason=return_reason
+            )
+
+            conn.commit()
+            st.cache_data.clear()
+
             st.success(msg)
+            st.info(
+                f"目标 Lot 编号：{lot_id}；"
+                "系统已写入库存流水和退货处理日志。"
+            )
+
             st.rerun()
-        else:
-            st.error(msg)
 
-    st.markdown("---")
+        except sqlite3.OperationalError as e:
+            conn.rollback()
 
-    # =========================
-    # 5. 下方直接复用规格化库存查询区块
-    # =========================
-    if "render_spec_stock_query_section" in globals():
-        render_spec_stock_query_section(
-            conn,
-            section_key_prefix="return_restock_spec_stock_query"
-        )
+            if "database is locked" in str(e).lower():
+                st.error("数据库当前被锁定，请关闭其他运行中的 Streamlit 进程后重试。")
+            else:
+                st.error(f"退货处理失败：{e}")
+
+        except Exception as e:
+            conn.rollback()
+            st.error(f"退货处理失败：{e}")
 
 def page_inventory_lot(conn):
     st.header("库存")
@@ -19499,15 +20095,24 @@ def generate_unique_route_code(conn, special_process, material):
             return candidate
         i += 1
 
+
 def get_production_route_from_config(conn, special_process="STANDARD", material="ALL"):
     """
     优先从 route_master / route_step_config 读取生产路线。
 
-    匹配优先级：
-    1. special_process + material 精确匹配
-    2. special_process + ALL
-    3. STANDARD_ROUTE
-    4. 旧代码默认路线兜底
+    修正版匹配逻辑：
+    1. 如果是特殊工艺，例如 LASER / CHAMFER / DRILLING：
+       - 先找 special_process + material 精确路线
+       - 再找 special_process + ALL 通用路线
+       - 如果找不到，自动生成特殊工艺默认路线：
+         Cutting → Rough Cleaning → Fine Cleaning 1 → 特殊工艺 → Fine Cleaning 2 → Semi Finished Warehouse
+
+    2. 如果是 STANDARD / 无特殊工艺：
+       - 找 STANDARD_ROUTE
+       - 找不到则返回标准默认路线
+
+    重点：
+    特殊工艺批次不能直接回退到 STANDARD_ROUTE。
     """
 
     ensure_production_route_config_schema(conn)
@@ -19515,37 +20120,111 @@ def get_production_route_from_config(conn, special_process="STANDARD", material=
     sp = normalize_text(special_process).upper() or "STANDARD"
     mat = normalize_text(material).upper() or "ALL"
 
+    no_special_values = [
+        "",
+        "STANDARD",
+        "NONE",
+        "NO",
+        "N/A",
+        "NA",
+        "无",
+        "无特殊工艺",
+    ]
+
+    is_special = sp not in [x.upper() for x in no_special_values]
+
+    # =========================
+    # 1. 特殊工艺：只查特殊工艺路线
+    # =========================
+    if is_special:
+        route_df = pd.read_sql_query("""
+            SELECT *
+            FROM route_master
+            WHERE is_active = 1
+              AND (
+                    (
+                        UPPER(COALESCE(special_process, '')) = ?
+                        AND UPPER(COALESCE(material, 'ALL')) = ?
+                    )
+                 OR (
+                        UPPER(COALESCE(special_process, '')) = ?
+                        AND UPPER(COALESCE(material, 'ALL')) = 'ALL'
+                    )
+              )
+            ORDER BY
+                CASE
+                    WHEN UPPER(COALESCE(special_process, '')) = ?
+                     AND UPPER(COALESCE(material, 'ALL')) = ?
+                    THEN 1
+
+                    WHEN UPPER(COALESCE(special_process, '')) = ?
+                     AND UPPER(COALESCE(material, 'ALL')) = 'ALL'
+                    THEN 2
+
+                    ELSE 99
+                END,
+                route_id
+            LIMIT 1
+        """, conn, params=[
+            sp, mat,
+            sp,
+            sp, mat,
+            sp,
+        ])
+
+        if not route_df.empty:
+            route_id = int(route_df.iloc[0]["route_id"])
+
+            step_df = pd.read_sql_query("""
+                SELECT process_step
+                FROM route_step_config
+                WHERE route_id = ?
+                  AND COALESCE(is_required, 1) = 1
+                ORDER BY step_order
+            """, conn, params=[route_id])
+
+            steps = step_df["process_step"].dropna().astype(str).tolist()
+
+            if steps:
+                return steps
+
+        # 特殊工艺没有配置时，不能回退 STANDARD_ROUTE
+        # 应该自动插入特殊工艺步骤
+        return [
+            "Cutting",
+            "Rough Cleaning",
+            "Fine Cleaning 1",
+            sp,
+            "Fine Cleaning 2",
+            "Semi Finished Warehouse",
+        ]
+
+    # =========================
+    # 2. 无特殊工艺：查 STANDARD_ROUTE
+    # =========================
     route_df = pd.read_sql_query("""
         SELECT *
         FROM route_master
         WHERE is_active = 1
           AND (
-                (UPPER(COALESCE(special_process, '')) = ? AND UPPER(COALESCE(material, 'ALL')) = ?)
-             OR (UPPER(COALESCE(special_process, '')) = ? AND UPPER(COALESCE(material, 'ALL')) = 'ALL')
-             OR route_code = 'STANDARD_ROUTE'
+                route_code = 'STANDARD_ROUTE'
+             OR UPPER(COALESCE(special_process, '')) = 'STANDARD'
           )
         ORDER BY
             CASE
-                WHEN UPPER(COALESCE(special_process, '')) = ? AND UPPER(COALESCE(material, 'ALL')) = ? THEN 1
-                WHEN UPPER(COALESCE(special_process, '')) = ? AND UPPER(COALESCE(material, 'ALL')) = 'ALL' THEN 2
-                WHEN route_code = 'STANDARD_ROUTE' THEN 3
+                WHEN route_code = 'STANDARD_ROUTE' THEN 1
+                WHEN UPPER(COALESCE(special_process, '')) = 'STANDARD' THEN 2
                 ELSE 99
             END,
             route_id
         LIMIT 1
-    """, conn, params=[
-        sp, mat,
-        sp,
-        sp, mat,
-        sp,
-    ])
+    """, conn)
 
     if not route_df.empty:
         route_id = int(route_df.iloc[0]["route_id"])
 
         step_df = pd.read_sql_query("""
-            SELECT
-                process_step
+            SELECT process_step
             FROM route_step_config
             WHERE route_id = ?
               AND COALESCE(is_required, 1) = 1
@@ -19557,27 +20236,15 @@ def get_production_route_from_config(conn, special_process="STANDARD", material=
         if steps:
             return steps
 
-    # 兜底：没有配置时继续使用旧逻辑
-    if "get_production_route" in globals():
-        return get_production_route(special_process)
-
-    no_values = ["", "STANDARD", "NONE", "NO", "N/A", "NA", "无", "无特殊工艺"]
-    if sp in no_values:
-        return [
-            "Cutting",
-            "Rough Cleaning",
-            "Fine Cleaning",
-            "Semi Finished Warehouse",
-        ]
-
+    # 标准路线兜底
     return [
         "Cutting",
         "Rough Cleaning",
-        "Fine Cleaning 1",
-        sp,
-        "Fine Cleaning 2",
+        "Fine Cleaning",
         "Semi Finished Warehouse",
     ]
+
+
 
 def page_production_route_config(conn):
     st.header("生产路线配置")
