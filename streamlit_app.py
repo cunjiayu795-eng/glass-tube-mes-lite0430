@@ -16361,15 +16361,877 @@ def page_return_restock_to_spec_inventory(conn):
             conn.rollback()
             st.error(f"退货处理失败：{e}")
 
+def page_return_hold_processing(conn):
+    """
+    RETURN-HOLD 退货暂存品后续处理页面。
+
+    支持：
+    1. RETURN-HOLD → WH-SPEC
+       复检合格，转入规格化库存，可再次销售。
+
+    2. RETURN-HOLD → WH-ORDER
+       退货仍属于原订单，转回原订单库存。
+
+    3. RETURN-HOLD → SCRAP
+       复检不合格，转入报废库存 / 不可销售库存。
+
+    4. RETURN-HOLD → 继续暂存
+       只记录复检意见，不改变库位。
+    """
+
+    st.header("仓储｜退货暂存处理 RETURN-HOLD")
+
+    st.info(
+        "本页面用于处理已经进入 RETURN-HOLD 的退货暂存品。"
+        "操作前请先确认退货来源、规格、特殊工艺、材质和数量。"
+        "处理结果可以转入 WH-SPEC、WH-ORDER、SCRAP，或继续保持暂存。"
+    )
+
+    # =====================================================
+    # 0. 内部安全函数
+    # =====================================================
+    def _text(v, default=""):
+        try:
+            value = normalize_text(v)
+        except Exception:
+            value = "" if v is None else str(v).strip()
+        return value if value else default
+
+    def _float(v, default=0.0):
+        try:
+            if pd.isna(v):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    def _int(v, default=None):
+        try:
+            if pd.isna(v):
+                return default
+            return int(v)
+        except Exception:
+            return default
+
+    def _now_code():
+        return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def _ensure_return_hold_process_log_table():
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS return_hold_process_log (
+                process_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_hold_lot_id INTEGER,
+                source_hold_lot_code TEXT,
+                source_trace_key TEXT,
+                target_action TEXT,
+                target_inventory_lot_id INTEGER,
+                process_qty REAL,
+                operator_name TEXT,
+                reference_no TEXT,
+                process_reason TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def _insert_inventory_txn(lot_id, txn_type, qty, reason, reference_no):
+        conn.execute("""
+            INSERT INTO inventory_transaction_log (
+                inventory_lot_id,
+                txn_type,
+                qty,
+                txn_time,
+                txn_reason,
+                reference_no
+            ) VALUES (?, ?, ?, datetime('now'), ?, ?)
+        """, (
+            int(lot_id),
+            _text(txn_type),
+            float(qty),
+            _text(reason),
+            _text(reference_no)
+        ))
+
+    def _insert_hold_process_log(source_row, target_action, target_lot_id, qty, operator_name, reference_no, reason):
+        _ensure_return_hold_process_log_table()
+
+        conn.execute("""
+            INSERT INTO return_hold_process_log (
+                source_hold_lot_id,
+                source_hold_lot_code,
+                source_trace_key,
+                target_action,
+                target_inventory_lot_id,
+                process_qty,
+                operator_name,
+                reference_no,
+                process_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _int(source_row.get("inventory_lot_id")),
+            _text(source_row.get("lot_code")),
+            _text(source_row.get("trace_key")),
+            _text(target_action),
+            _int(target_lot_id),
+            float(qty),
+            _text(operator_name),
+            _text(reference_no),
+            _text(reason)
+        ))
+
+    def _parse_hold_variant(row):
+        """
+        从 RETURN-HOLD lot 中解析规格、工艺、材质。
+        优先 trace_key，其次主数据字段。
+        """
+        parsed = {
+            "spec_code": "",
+            "special_process": "",
+            "material": "",
+        }
+
+        trace_key = _text(row.get("trace_key"))
+
+        if "parse_inventory_variant_from_trace_key" in globals():
+            try:
+                p = parse_inventory_variant_from_trace_key(trace_key)
+                parsed["spec_code"] = _text(p.get("parsed_spec_code"))
+                parsed["special_process"] = _text(p.get("parsed_special_process"))
+                parsed["material"] = _text(p.get("parsed_material"))
+            except Exception:
+                pass
+
+        if not parsed["spec_code"]:
+            parsed["spec_code"] = _text(row.get("spec_code"))
+
+        if not parsed["special_process"]:
+            parsed["special_process"] = _text(row.get("raw_special_process"), "STANDARD")
+
+        if not parsed["material"]:
+            parsed["material"] = _text(row.get("raw_material"), "UNKNOWN_MATERIAL")
+
+        parsed["special_process"] = parsed["special_process"].upper()
+        parsed["material"] = parsed["material"].upper()
+
+        return parsed
+
+    def _make_spec_stock_key(row):
+        variant = _parse_hold_variant(row)
+
+        return build_spec_stock_group_key(
+            variant["spec_code"] or "UNKNOWN_SPEC",
+            variant["special_process"] or "STANDARD",
+            variant["material"] or "UNKNOWN_MATERIAL"
+        )
+
+    def _make_order_trace_key(row):
+        """
+        RETURN-HOLD 的 trace_key 通常是 RETURN_HOLD__原TraceKey。
+        如果能识别原 Trace Key，则转回 WH-ORDER 使用原 Trace Key。
+        """
+        trace_key = _text(row.get("trace_key"))
+
+        if trace_key.startswith("RETURN_HOLD__"):
+            original_key = trace_key.replace("RETURN_HOLD__", "", 1)
+            if original_key:
+                return original_key
+
+        # 兜底：用来源 PO + 规格 + 工艺 + 材质重建
+        variant = _parse_hold_variant(row)
+
+        return build_trace_key(
+            po_no=_text(row.get("po_no"), "NOPO"),
+            spec_code=variant["spec_code"] or _text(row.get("spec_code"), "UNKNOWN_SPEC"),
+            special_process=variant["special_process"] or "STANDARD",
+            material=variant["material"] or "UNKNOWN_MATERIAL"
+        )
+
+    def _decrease_hold_lot(source_lot_id, qty):
+        """
+        从 RETURN-HOLD 扣减处理数量。
+        """
+        conn.execute("""
+            UPDATE inventory_lot
+            SET available_qty = COALESCE(available_qty, 0) - ?,
+                lot_status = CASE
+                    WHEN COALESCE(available_qty, 0) - ? <= 0 THEN 'depleted'
+                    ELSE 'hold'
+                END
+            WHERE inventory_lot_id = ?
+        """, (
+            float(qty),
+            float(qty),
+            int(source_lot_id)
+        ))
+
+    def _create_or_update_wh_spec(row, qty):
+        """
+        转入 WH-SPEC。
+        """
+        variant = _parse_hold_variant(row)
+
+        product_id = _int(row.get("product_id"))
+        spec_id = _int(row.get("spec_id"))
+        spec_code = variant["spec_code"]
+        special_process = variant["special_process"] or "STANDARD"
+        material = variant["material"] or "UNKNOWN_MATERIAL"
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能转入 WH-SPEC。", None
+
+        if not spec_code or spec_code == "UNKNOWN_SPEC":
+            return False, "无法识别产品规格，不能转入 WH-SPEC。", None
+
+        if not material or material == "UNKNOWN_MATERIAL":
+            return False, "无法识别材质，不能转入 WH-SPEC。", None
+
+        spec_stock_key = build_spec_stock_group_key(
+            spec_code,
+            special_process,
+            material
+        )
+
+        lot_df = pd.read_sql_query("""
+            SELECT
+                inventory_lot_id
+            FROM inventory_lot
+            WHERE location = 'WH-SPEC'
+              AND trace_key = ?
+              AND COALESCE(lot_status, 'available') IN ('available', 'partial')
+              AND COALESCE(release_status, 'released') = 'released'
+            ORDER BY inventory_lot_id
+            LIMIT 1
+        """, conn, params=[spec_stock_key])
+
+        if lot_df.empty:
+            lot_code = (
+                "LOT-SPEC-"
+                + normalize_trace_part(spec_code, "NOSPEC")
+                + "-"
+                + normalize_trace_part(special_process, "STANDARD")
+                + "-"
+                + normalize_trace_part(material, "UNKNOWN_MATERIAL")
+                + "-"
+                + _now_code()
+            )
+
+            conn.execute("""
+                INSERT INTO inventory_lot (
+                    product_id,
+                    spec_id,
+                    production_batch_id,
+                    trace_key,
+                    lot_code,
+                    location,
+                    available_qty,
+                    reserved_qty,
+                    lot_status,
+                    release_status,
+                    exclusive_customer,
+                    forbidden_customer
+                ) VALUES (?, ?, NULL, ?, ?, 'WH-SPEC', ?, 0, 'available', 'released', '', '')
+            """, (
+                int(product_id),
+                int(spec_id),
+                spec_stock_key,
+                lot_code,
+                float(qty)
+            ))
+
+            target_lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        else:
+            target_lot_id = int(lot_df.iloc[0]["inventory_lot_id"])
+
+            conn.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) + ?,
+                    lot_status = 'available',
+                    release_status = 'released'
+                WHERE inventory_lot_id = ?
+            """, (
+                float(qty),
+                int(target_lot_id)
+            ))
+
+        return True, "已转入 WH-SPEC 规格化库存。", target_lot_id
+
+    def _create_or_update_wh_order(row, qty):
+        """
+        转回 WH-ORDER。
+        """
+        product_id = _int(row.get("product_id"))
+        spec_id = _int(row.get("spec_id"))
+        production_batch_id = _int(row.get("production_batch_id"))
+        order_trace_key = _make_order_trace_key(row)
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能转回 WH-ORDER。", None
+
+        if not order_trace_key:
+            return False, "无法识别原订单 Trace Key，不能转回 WH-ORDER。", None
+
+        lot_df = pd.read_sql_query("""
+            SELECT
+                inventory_lot_id
+            FROM inventory_lot
+            WHERE location = 'WH-ORDER'
+              AND trace_key = ?
+              AND COALESCE(lot_status, 'available') IN ('available', 'partial', 'hold', 'depleted')
+            ORDER BY inventory_lot_id
+            LIMIT 1
+        """, conn, params=[order_trace_key])
+
+        if lot_df.empty:
+            lot_code = "LOT-ORDER-RETURN-HOLD-" + _now_code()
+
+            conn.execute("""
+                INSERT INTO inventory_lot (
+                    product_id,
+                    spec_id,
+                    production_batch_id,
+                    trace_key,
+                    lot_code,
+                    location,
+                    available_qty,
+                    reserved_qty,
+                    lot_status,
+                    release_status,
+                    exclusive_customer,
+                    forbidden_customer
+                ) VALUES (?, ?, ?, ?, ?, 'WH-ORDER', ?, 0, 'available', 'released', ?, '')
+            """, (
+                int(product_id),
+                int(spec_id),
+                production_batch_id,
+                order_trace_key,
+                lot_code,
+                float(qty),
+                _text(row.get("customer_name"))
+            ))
+
+            target_lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        else:
+            target_lot_id = int(lot_df.iloc[0]["inventory_lot_id"])
+
+            conn.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) + ?,
+                    lot_status = 'available',
+                    release_status = 'released'
+                WHERE inventory_lot_id = ?
+            """, (
+                float(qty),
+                int(target_lot_id)
+            ))
+
+        return True, "已转回 WH-ORDER 原订单库存。", target_lot_id
+
+    def _create_or_update_scrap(row, qty):
+        """
+        转入 SCRAP 报废 / 不合格库存。
+        """
+        product_id = _int(row.get("product_id"))
+        spec_id = _int(row.get("spec_id"))
+        production_batch_id = _int(row.get("production_batch_id"))
+        trace_key = _text(row.get("trace_key"), "UNKNOWN_RETURN_HOLD")
+
+        if product_id is None or spec_id is None:
+            return False, "无法识别产品或规格编号，不能转入 SCRAP。", None
+
+        scrap_key = f"SCRAP__{trace_key}"
+
+        lot_code = "LOT-SCRAP-" + _now_code()
+
+        conn.execute("""
+            INSERT INTO inventory_lot (
+                product_id,
+                spec_id,
+                production_batch_id,
+                trace_key,
+                lot_code,
+                location,
+                available_qty,
+                reserved_qty,
+                lot_status,
+                release_status,
+                exclusive_customer,
+                forbidden_customer
+            ) VALUES (?, ?, ?, ?, ?, 'SCRAP', ?, 0, 'scrapped', 'rejected', '', '')
+        """, (
+            int(product_id),
+            int(spec_id),
+            production_batch_id,
+            scrap_key,
+            lot_code,
+            float(qty)
+        ))
+
+        target_lot_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        return True, "已转入 SCRAP 报废 / 不合格库存。", target_lot_id
+
+    # =====================================================
+    # 1. 查询 RETURN-HOLD 列表
+    # =====================================================
+    hold_df = pd.read_sql_query("""
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.production_batch_id,
+            il.product_id,
+            il.spec_id,
+            il.trace_key,
+            il.location,
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
+            COALESCE(il.lot_status, 'hold') AS lot_status,
+            COALESCE(il.release_status, 'pending') AS release_status,
+            il.last_out_qty,
+            il.last_out_time,
+
+            p.product_name,
+            p.product_code,
+            ps.spec_code,
+            ps.spec_desc,
+
+            pb.batch_code,
+            COALESCE(pb.special_process, oi.special_process, 'STANDARD') AS raw_special_process,
+            COALESCE(pb.material, oi.material, 'UNKNOWN_MATERIAL') AS raw_material,
+
+            oi.order_item_id,
+            oi.po_no,
+            oi.customer_pn,
+            oi.product_type_text,
+            oi.product_spec_text,
+            oi.trace_key AS order_trace_key,
+
+            c.customer_name
+
+        FROM inventory_lot il
+        LEFT JOIN product p
+            ON il.product_id = p.product_id
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
+        WHERE il.location = 'RETURN-HOLD'
+          AND COALESCE(il.available_qty, 0) > 0
+          AND COALESCE(il.lot_status, 'hold') != 'depleted'
+
+        ORDER BY il.inventory_lot_id DESC
+    """, conn)
+
+    if hold_df.empty:
+        st.success("当前没有待处理的 RETURN-HOLD 暂存品。")
+        return
+
+    # 解析显示字段
+    hold_df = hold_df.copy()
+
+    parsed_list = hold_df.apply(_parse_hold_variant, axis=1)
+    hold_df["display_spec_code"] = parsed_list.apply(lambda x: x.get("spec_code", "UNKNOWN_SPEC"))
+    hold_df["display_special_process"] = parsed_list.apply(lambda x: x.get("special_process", "STANDARD"))
+    hold_df["display_material"] = parsed_list.apply(lambda x: x.get("material", "UNKNOWN_MATERIAL"))
+    hold_df["variant_label"] = (
+        hold_df["display_special_process"].astype(str)
+        + " / "
+        + hold_df["display_material"].astype(str)
+    )
+
+    total_hold_qty = float(pd.to_numeric(hold_df["available_qty"], errors="coerce").fillna(0).sum())
+    hold_lot_count = int(hold_df["inventory_lot_id"].nunique())
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("待处理暂存数量", f"{total_hold_qty:.0f}")
+    m2.metric("待处理 Lot 数", hold_lot_count)
+    m3.metric("当前库位", "RETURN-HOLD")
+
+    st.markdown("---")
+
+    st.subheader("第一步：选择待处理暂存 Lot")
+
+    preview_cols = [
+        "inventory_lot_id",
+        "lot_code",
+        "customer_name",
+        "po_no",
+        "product_name",
+        "display_spec_code",
+        "variant_label",
+        "available_qty",
+        "lot_status",
+        "release_status",
+        "batch_code",
+        "trace_key",
+    ]
+
+    existing_preview_cols = [c for c in preview_cols if c in hold_df.columns]
+
+    show_df(hold_df[existing_preview_cols].rename(columns={
+        "inventory_lot_id": "Lot编号",
+        "lot_code": "Lot号",
+        "customer_name": "来源客户",
+        "po_no": "来源PO",
+        "product_name": "产品",
+        "display_spec_code": "规格",
+        "variant_label": "工艺 / 材质",
+        "available_qty": "暂存数量",
+        "lot_status": "Lot状态",
+        "release_status": "放行状态",
+        "batch_code": "来源生产批号",
+        "trace_key": "Trace Key",
+    }), hide_index=True)
+
+    hold_df = hold_df.reset_index(drop=True)
+
+    selected_idx = st.selectbox(
+        "选择要处理的 RETURN-HOLD Lot",
+        hold_df.index.tolist(),
+        format_func=lambda i: (
+            f"Lot {hold_df.loc[i, 'lot_code']} | "
+            f"规格 {hold_df.loc[i, 'display_spec_code']} | "
+            f"{hold_df.loc[i, 'variant_label']} | "
+            f"数量 {float(hold_df.loc[i, 'available_qty']):.0f}"
+        ),
+        key="return_hold_lot_select"
+    )
+
+    selected = hold_df.loc[selected_idx].copy()
+
+    st.markdown("#### 当前暂存 Lot 信息")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Lot编号", int(selected["inventory_lot_id"]))
+    c2.metric("Lot号", _text(selected.get("lot_code"), "-"))
+    c3.metric("暂存数量", f"{_float(selected.get('available_qty')):.0f}")
+    c4.metric("状态", f"{_text(selected.get('lot_status'))} / {_text(selected.get('release_status'))}")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("来源客户", _text(selected.get("customer_name"), "-"))
+    c6.metric("来源PO", _text(selected.get("po_no"), "-"))
+    c7.metric("生产批号", _text(selected.get("batch_code"), "-"))
+    c8.metric("产品", _text(selected.get("product_name"), "-"))
+
+    c9, c10, c11 = st.columns(3)
+    c9.metric("规格", _text(selected.get("display_spec_code"), "-"))
+    c10.metric("特殊工艺", _text(selected.get("display_special_process"), "-"))
+    c11.metric("材质", _text(selected.get("display_material"), "-"))
+
+    st.markdown("RETURN-HOLD Trace Key")
+    st.code(_text(selected.get("trace_key"), "-"))
+
+    # =====================================================
+    # 2. 选择处理方式
+    # =====================================================
+    st.markdown("---")
+    st.subheader("第二步：选择处理方式")
+
+    action = st.radio(
+        "处理结果",
+        [
+            "复检合格 → 转入 WH-SPEC",
+            "复检合格 → 转回 WH-ORDER",
+            "复检不合格 → 转入 SCRAP",
+            "继续暂存 RETURN-HOLD",
+        ],
+        horizontal=False,
+        key="return_hold_action"
+    )
+
+    if action == "复检合格 → 转入 WH-SPEC":
+        st.success("该暂存品将转入 WH-SPEC 规格化库存，可再次销售。")
+        st.markdown("目标规格化库存池")
+        st.code(_make_spec_stock_key(selected))
+
+    elif action == "复检合格 → 转回 WH-ORDER":
+        st.success("该暂存品将转回 WH-ORDER 原订单库存。")
+        st.markdown("目标订单 Trace Key")
+        st.code(_make_order_trace_key(selected))
+
+    elif action == "复检不合格 → 转入 SCRAP":
+        st.error("该暂存品将转入 SCRAP 报废 / 不合格库存，不可销售。")
+        st.markdown("目标 SCRAP Key")
+        st.code(f"SCRAP__{_text(selected.get('trace_key'))}")
+
+    else:
+        st.warning("该暂存品将继续保留在 RETURN-HOLD，仅记录复检意见。")
+
+    # =====================================================
+    # 3. 确认处理数量
+    # =====================================================
+    st.markdown("---")
+    st.subheader("第三步：确认处理数量")
+
+    max_qty = _float(selected.get("available_qty"))
+    default_qty = min(1.0, max_qty) if max_qty > 0 else 0.0
+
+    with st.form("return_hold_process_form"):
+        q1, q2, q3 = st.columns(3)
+
+        with q1:
+            process_qty = st.number_input(
+                "处理数量",
+                min_value=0.0,
+                max_value=float(max_qty),
+                value=float(default_qty),
+                step=1.0,
+                help="处理数量不能超过该 RETURN-HOLD Lot 的当前暂存数量。"
+            )
+
+        with q2:
+            operator_name = st.text_input(
+                "操作人",
+                value="QC / Warehouse User"
+            )
+
+        with q3:
+            reference_no = st.text_input(
+                "处理单号 / 复检单号",
+                value=f"HOLD-PROCESS-{_now_code()}"
+            )
+
+        process_reason = st.text_area(
+            "复检 / 处理说明",
+            value=""
+        )
+
+        submitted = st.form_submit_button("确认处理 RETURN-HOLD")
+
+    if submitted:
+        if float(process_qty or 0) <= 0:
+            st.error("处理数量必须大于 0。")
+            return
+
+        if float(process_qty) > max_qty:
+            st.error(f"处理数量不能超过当前暂存数量：{max_qty:.0f}。")
+            return
+
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+            source_lot_id = int(selected["inventory_lot_id"])
+            target_lot_id = None
+            ok = True
+            msg = ""
+
+            # =========================
+            # A. 转入 WH-SPEC
+            # =========================
+            if action == "复检合格 → 转入 WH-SPEC":
+                ok, msg, target_lot_id = _create_or_update_wh_spec(
+                    selected,
+                    float(process_qty)
+                )
+
+                if not ok:
+                    conn.rollback()
+                    st.error(msg)
+                    return
+
+                _decrease_hold_lot(source_lot_id, float(process_qty))
+
+                _insert_inventory_txn(
+                    lot_id=source_lot_id,
+                    txn_type="RETURN_HOLD_TO_SPEC_OUT",
+                    qty=-float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转出到 WH-SPEC",
+                    reference_no=reference_no
+                )
+
+                _insert_inventory_txn(
+                    lot_id=target_lot_id,
+                    txn_type="RETURN_HOLD_TO_SPEC_IN",
+                    qty=float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转入 WH-SPEC",
+                    reference_no=reference_no
+                )
+
+            # =========================
+            # B. 转回 WH-ORDER
+            # =========================
+            elif action == "复检合格 → 转回 WH-ORDER":
+                ok, msg, target_lot_id = _create_or_update_wh_order(
+                    selected,
+                    float(process_qty)
+                )
+
+                if not ok:
+                    conn.rollback()
+                    st.error(msg)
+                    return
+
+                _decrease_hold_lot(source_lot_id, float(process_qty))
+
+                _insert_inventory_txn(
+                    lot_id=source_lot_id,
+                    txn_type="RETURN_HOLD_TO_ORDER_OUT",
+                    qty=-float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转出到 WH-ORDER",
+                    reference_no=reference_no
+                )
+
+                _insert_inventory_txn(
+                    lot_id=target_lot_id,
+                    txn_type="RETURN_HOLD_TO_ORDER_IN",
+                    qty=float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转回 WH-ORDER",
+                    reference_no=reference_no
+                )
+
+            # =========================
+            # C. 转入 SCRAP
+            # =========================
+            elif action == "复检不合格 → 转入 SCRAP":
+                ok, msg, target_lot_id = _create_or_update_scrap(
+                    selected,
+                    float(process_qty)
+                )
+
+                if not ok:
+                    conn.rollback()
+                    st.error(msg)
+                    return
+
+                _decrease_hold_lot(source_lot_id, float(process_qty))
+
+                _insert_inventory_txn(
+                    lot_id=source_lot_id,
+                    txn_type="RETURN_HOLD_TO_SCRAP_OUT",
+                    qty=-float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转出到 SCRAP",
+                    reference_no=reference_no
+                )
+
+                _insert_inventory_txn(
+                    lot_id=target_lot_id,
+                    txn_type="RETURN_HOLD_TO_SCRAP_IN",
+                    qty=float(process_qty),
+                    reason=process_reason or "RETURN-HOLD 转入 SCRAP",
+                    reference_no=reference_no
+                )
+
+            # =========================
+            # D. 继续暂存
+            # =========================
+            else:
+                target_lot_id = source_lot_id
+
+                conn.execute("""
+                    UPDATE inventory_lot
+                    SET lot_status = 'hold',
+                        release_status = 'pending'
+                    WHERE inventory_lot_id = ?
+                """, (
+                    int(source_lot_id),
+                ))
+
+                _insert_inventory_txn(
+                    lot_id=source_lot_id,
+                    txn_type="RETURN_HOLD_RECHECK_KEEP",
+                    qty=0,
+                    reason=process_reason or "复检后继续暂存 RETURN-HOLD",
+                    reference_no=reference_no
+                )
+
+                msg = "已记录复检意见，该 Lot 继续保留在 RETURN-HOLD。"
+
+            _insert_hold_process_log(
+                source_row=selected,
+                target_action=action,
+                target_lot_id=target_lot_id,
+                qty=float(process_qty),
+                operator_name=operator_name,
+                reference_no=reference_no,
+                reason=process_reason
+            )
+
+            conn.commit()
+            st.cache_data.clear()
+
+            st.success(msg)
+            st.info(
+                f"来源 RETURN-HOLD Lot：{source_lot_id}；"
+                f"目标 Lot：{target_lot_id}；"
+                "系统已写入库存流水和暂存处理日志。"
+            )
+
+            st.rerun()
+
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+
+            if "database is locked" in str(e).lower():
+                st.error("数据库当前被锁定，请关闭其他运行中的 Streamlit 进程后重试。")
+            else:
+                st.error(f"RETURN-HOLD 处理失败：{e}")
+
+        except Exception as e:
+            conn.rollback()
+            st.error(f"RETURN-HOLD 处理失败：{e}")
+
+    # =====================================================
+    # 4. 历史处理记录
+    # =====================================================
+    st.markdown("---")
+    st.subheader("RETURN-HOLD 处理历史")
+
+    _ensure_return_hold_process_log_table()
+
+    log_df = pd.read_sql_query("""
+        SELECT
+            process_id,
+            source_hold_lot_id,
+            source_hold_lot_code,
+            source_trace_key,
+            target_action,
+            target_inventory_lot_id,
+            process_qty,
+            operator_name,
+            reference_no,
+            process_reason,
+            created_at
+        FROM return_hold_process_log
+        ORDER BY process_id DESC
+        LIMIT 100
+    """, conn)
+
+    if log_df.empty:
+        st.info("当前没有 RETURN-HOLD 后续处理记录。")
+    else:
+        show_df(log_df.rename(columns={
+            "process_id": "处理编号",
+            "source_hold_lot_id": "来源暂存Lot编号",
+            "source_hold_lot_code": "来源暂存Lot号",
+            "source_trace_key": "来源Trace Key",
+            "target_action": "处理方式",
+            "target_inventory_lot_id": "目标Lot编号",
+            "process_qty": "处理数量",
+            "operator_name": "操作人",
+            "reference_no": "处理单号",
+            "process_reason": "处理说明",
+            "created_at": "处理时间",
+        }), hide_index=True)
+
 def page_inventory_lot(conn):
     st.header("库存")
 
     st.info(
         "库存页面用于查看库存明细。"
         "订单库存 WH-ORDER 按订单 / Trace Key 追踪；"
-        "规格化库存 WH-SPEC 按【产品规格 + 特殊工艺 + 材质】聚合查询。"
-        "其中 WH-SPEC 会优先从 Trace Key 解析规格、特殊工艺和材质，"
-        "避免退货再上架库存显示为 UNKNOWN_MATERIAL。"
+        "规格化库存 WH-SPEC 按【产品规格 + 特殊工艺 + 材质】聚合查询；"
+        "退货暂存 RETURN-HOLD 用于存放已退回但尚未复检 / 判定的货物；"
+        "报废库存 SCRAP 用于存放复检不合格或已判定不可销售的货物。"
     )
 
     # =========================
@@ -16412,6 +17274,8 @@ def page_inventory_lot(conn):
                 WHEN il.location = 'WH-ORDER' THEN '订单库存'
                 WHEN il.location = 'WH-SPEC' THEN '规格化库存'
                 WHEN il.trace_key LIKE 'SPEC_STOCK%' THEN '规格化库存'
+                WHEN il.location = 'RETURN-HOLD' THEN '退货暂存'
+                WHEN il.location = 'SCRAP' THEN '报废库存'
                 ELSE '其他库存'
             END AS stock_type
 
@@ -16432,56 +17296,74 @@ def page_inventory_lot(conn):
             ON o.customer_id = c.customer_id
 
         ORDER BY
-            stock_type,
-            il.location,
+            CASE
+                WHEN il.location = 'WH-ORDER' THEN 1
+                WHEN il.location = 'WH-SPEC' THEN 2
+                WHEN il.location = 'RETURN-HOLD' THEN 3
+                WHEN il.location = 'SCRAP' THEN 4
+                ELSE 9
+            END,
             ps.spec_code,
             il.inventory_lot_id DESC
     """, conn)
 
     # =========================
-    # 2. WH-SPEC 显示修正
+    # 2. 展示字段修正
     # =========================
     if not stock_df.empty:
         stock_df = stock_df.copy()
 
-        parsed_rows = stock_df["trace_key"].apply(parse_inventory_variant_from_trace_key)
+        if "parse_inventory_variant_from_trace_key" in globals():
+            parsed_rows = stock_df["trace_key"].apply(parse_inventory_variant_from_trace_key)
 
-        stock_df["parsed_spec_code"] = parsed_rows.apply(
-            lambda x: x.get("parsed_spec_code", "")
-        )
-        stock_df["parsed_special_process"] = parsed_rows.apply(
-            lambda x: x.get("parsed_special_process", "")
-        )
-        stock_df["parsed_material"] = parsed_rows.apply(
-            lambda x: x.get("parsed_material", "")
-        )
+            stock_df["parsed_spec_code"] = parsed_rows.apply(
+                lambda x: x.get("parsed_spec_code", "")
+            )
+            stock_df["parsed_special_process"] = parsed_rows.apply(
+                lambda x: x.get("parsed_special_process", "")
+            )
+            stock_df["parsed_material"] = parsed_rows.apply(
+                lambda x: x.get("parsed_material", "")
+            )
+        else:
+            stock_df["parsed_spec_code"] = ""
+            stock_df["parsed_special_process"] = ""
+            stock_df["parsed_material"] = ""
 
+        def _safe_text(v):
+            try:
+                return normalize_text(v)
+            except Exception:
+                return "" if v is None else str(v).strip()
+
+        # WH-SPEC / RETURN-HOLD / SCRAP 优先从 trace_key 解析；
+        # 其他库存优先使用主数据字段。
         stock_df["display_spec_code"] = stock_df.apply(
             lambda r: (
-                normalize_text(r.get("parsed_spec_code", ""))
-                if str(r.get("stock_type", "")) == "规格化库存"
-                and normalize_text(r.get("parsed_spec_code", ""))
-                else normalize_text(r.get("spec_code", ""))
+                _safe_text(r.get("parsed_spec_code", ""))
+                if str(r.get("stock_type", "")) in ["规格化库存", "退货暂存", "报废库存"]
+                and _safe_text(r.get("parsed_spec_code", ""))
+                else _safe_text(r.get("spec_code", ""))
             ) or "UNKNOWN_SPEC",
             axis=1
         )
 
         stock_df["display_special_process"] = stock_df.apply(
             lambda r: (
-                normalize_text(r.get("parsed_special_process", ""))
-                if str(r.get("stock_type", "")) == "规格化库存"
-                and normalize_text(r.get("parsed_special_process", ""))
-                else normalize_text(r.get("raw_special_process", ""))
+                _safe_text(r.get("parsed_special_process", ""))
+                if str(r.get("stock_type", "")) in ["规格化库存", "退货暂存", "报废库存"]
+                and _safe_text(r.get("parsed_special_process", ""))
+                else _safe_text(r.get("raw_special_process", ""))
             ) or "STANDARD",
             axis=1
         )
 
         stock_df["display_material"] = stock_df.apply(
             lambda r: (
-                normalize_text(r.get("parsed_material", ""))
-                if str(r.get("stock_type", "")) == "规格化库存"
-                and normalize_text(r.get("parsed_material", ""))
-                else normalize_text(r.get("raw_material", ""))
+                _safe_text(r.get("parsed_material", ""))
+                if str(r.get("stock_type", "")) in ["规格化库存", "退货暂存", "报废库存"]
+                and _safe_text(r.get("parsed_material", ""))
+                else _safe_text(r.get("raw_material", ""))
             ) or "UNKNOWN_MATERIAL",
             axis=1
         )
@@ -16506,6 +17388,21 @@ def page_inventory_lot(conn):
             + stock_df["display_material"].astype(str)
         )
 
+        stock_df["available_qty"] = pd.to_numeric(
+            stock_df["available_qty"],
+            errors="coerce"
+        ).fillna(0)
+
+        stock_df["reserved_qty"] = pd.to_numeric(
+            stock_df["reserved_qty"],
+            errors="coerce"
+        ).fillna(0)
+
+        stock_df["lot_total_qty"] = pd.to_numeric(
+            stock_df["lot_total_qty"],
+            errors="coerce"
+        ).fillna(0)
+
     # =========================
     # 3. 顶部指标
     # =========================
@@ -16513,13 +17410,10 @@ def page_inventory_lot(conn):
         total_stock_qty = 0.0
         order_stock_qty = 0.0
         spec_stock_qty = 0.0
+        return_hold_qty = 0.0
+        scrap_qty = 0.0
         other_stock_qty = 0.0
     else:
-        stock_df["lot_total_qty"] = pd.to_numeric(
-            stock_df["lot_total_qty"],
-            errors="coerce"
-        ).fillna(0)
-
         order_stock_qty = stock_df.loc[
             stock_df["stock_type"] == "订单库存",
             "lot_total_qty"
@@ -16530,28 +17424,48 @@ def page_inventory_lot(conn):
             "lot_total_qty"
         ].sum()
 
+        return_hold_qty = stock_df.loc[
+            stock_df["stock_type"] == "退货暂存",
+            "lot_total_qty"
+        ].sum()
+
+        scrap_qty = stock_df.loc[
+            stock_df["stock_type"] == "报废库存",
+            "lot_total_qty"
+        ].sum()
+
         other_stock_qty = stock_df.loc[
             stock_df["stock_type"] == "其他库存",
             "lot_total_qty"
         ].sum()
 
-        total_stock_qty = order_stock_qty + spec_stock_qty + other_stock_qty
+        total_stock_qty = (
+            float(order_stock_qty)
+            + float(spec_stock_qty)
+            + float(return_hold_qty)
+            + float(scrap_qty)
+            + float(other_stock_qty)
+        )
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("总库存", f"{float(total_stock_qty):.0f}")
     m2.metric("订单库存 WH-ORDER", f"{float(order_stock_qty):.0f}")
     m3.metric("规格化库存 WH-SPEC", f"{float(spec_stock_qty):.0f}")
-    m4.metric("其他库存", f"{float(other_stock_qty):.0f}")
+    m4.metric("退货暂存 RETURN-HOLD", f"{float(return_hold_qty):.0f}")
+    m5.metric("报废库存 SCRAP", f"{float(scrap_qty):.0f}")
+    m6.metric("其他库存", f"{float(other_stock_qty):.0f}")
 
     st.markdown("---")
 
     # =========================
     # 4. Tabs
     # =========================
-    tab_overview, tab_order, tab_spec, tab_txn = st.tabs([
+    tab_overview, tab_order, tab_spec, tab_return_hold, tab_scrap, tab_txn = st.tabs([
         "库存总览",
         "订单库存",
         "规格化库存",
+        "退货暂存",
+        "报废库存",
         "库存流水"
     ])
 
@@ -16569,7 +17483,9 @@ def page_inventory_lot(conn):
                 "inventory_lot_id",
                 "lot_code",
                 "product_name",
+                "product_code",
                 "display_spec_code",
+                "spec_desc",
                 "variant_label",
                 "display_special_process",
                 "display_material",
@@ -16583,6 +17499,8 @@ def page_inventory_lot(conn):
                 "po_no",
                 "customer_name",
                 "trace_key",
+                "last_out_qty",
+                "last_out_time",
             ]
 
             existing_cols = [
@@ -16595,7 +17513,9 @@ def page_inventory_lot(conn):
                 "inventory_lot_id": "Lot编号",
                 "lot_code": "Lot号",
                 "product_name": "产品名称",
+                "product_code": "产品编号",
                 "display_spec_code": "产品规格",
+                "spec_desc": "规格描述",
                 "variant_label": "工艺 / 材质",
                 "display_special_process": "特殊工艺",
                 "display_material": "材质",
@@ -16609,10 +17529,12 @@ def page_inventory_lot(conn):
                 "po_no": "来源PO",
                 "customer_name": "来源客户",
                 "trace_key": "Trace Key",
+                "last_out_qty": "最近出库数量",
+                "last_out_time": "最近出库时间",
             }), hide_index=True)
 
     # =========================
-    # 4.2 订单库存
+    # 4.2 订单库存 WH-ORDER
     # =========================
     with tab_order:
         st.subheader("订单库存 WH-ORDER")
@@ -16631,7 +17553,9 @@ def page_inventory_lot(conn):
                     "inventory_lot_id",
                     "lot_code",
                     "product_name",
+                    "product_code",
                     "display_spec_code",
+                    "spec_desc",
                     "variant_label",
                     "display_special_process",
                     "display_material",
@@ -16647,6 +17571,8 @@ def page_inventory_lot(conn):
                     "customer_name",
                     "po_no",
                     "trace_key",
+                    "last_out_qty",
+                    "last_out_time",
                 ]
 
                 existing_order_cols = [
@@ -16658,7 +17584,9 @@ def page_inventory_lot(conn):
                     "inventory_lot_id": "Lot编号",
                     "lot_code": "Lot号",
                     "product_name": "产品名称",
+                    "product_code": "产品编号",
                     "display_spec_code": "产品规格",
+                    "spec_desc": "规格描述",
                     "variant_label": "工艺 / 材质",
                     "display_special_process": "特殊工艺",
                     "display_material": "材质",
@@ -16674,19 +17602,282 @@ def page_inventory_lot(conn):
                     "customer_name": "来源客户",
                     "po_no": "来源PO",
                     "trace_key": "Trace Key",
+                    "last_out_qty": "最近出库数量",
+                    "last_out_time": "最近出库时间",
                 }), hide_index=True)
 
     # =========================
-    # 4.3 规格化库存
+    # 4.3 规格化库存 WH-SPEC
     # =========================
     with tab_spec:
-        render_spec_stock_query_section(
-            conn,
-            section_key_prefix="inventory_lot_page"
-        )
+        if "render_spec_stock_query_section" in globals():
+            render_spec_stock_query_section(
+                conn,
+                section_key_prefix="inventory_lot_page"
+            )
+        else:
+            st.subheader("规格化库存 WH-SPEC")
+
+            if stock_df.empty:
+                st.info("当前没有规格化库存。")
+            else:
+                spec_df = stock_df[
+                    stock_df["stock_type"] == "规格化库存"
+                ].copy()
+
+                if spec_df.empty:
+                    st.info("当前没有规格化库存。")
+                else:
+                    spec_cols = [
+                        "inventory_lot_id",
+                        "lot_code",
+                        "product_name",
+                        "display_spec_code",
+                        "spec_desc",
+                        "variant_label",
+                        "display_special_process",
+                        "display_material",
+                        "available_qty",
+                        "reserved_qty",
+                        "lot_total_qty",
+                        "lot_status",
+                        "release_status",
+                        "location",
+                        "trace_key",
+                    ]
+
+                    existing_spec_cols = [
+                        c for c in spec_cols
+                        if c in spec_df.columns
+                    ]
+
+                    show_df(spec_df[existing_spec_cols].rename(columns={
+                        "inventory_lot_id": "Lot编号",
+                        "lot_code": "Lot号",
+                        "product_name": "产品名称",
+                        "display_spec_code": "产品规格",
+                        "spec_desc": "规格描述",
+                        "variant_label": "工艺 / 材质",
+                        "display_special_process": "特殊工艺",
+                        "display_material": "材质",
+                        "available_qty": "可用数量",
+                        "reserved_qty": "预留数量",
+                        "lot_total_qty": "总数量",
+                        "lot_status": "Lot状态",
+                        "release_status": "放行状态",
+                        "location": "库位",
+                        "trace_key": "规格化库存Key",
+                    }), hide_index=True)
 
     # =========================
-    # 4.4 库存流水
+    # 4.4 退货暂存 RETURN-HOLD
+    # =========================
+    with tab_return_hold:
+        st.subheader("退货暂存 RETURN-HOLD")
+
+        st.info(
+            "RETURN-HOLD 用于存放已退回但尚未完成复检 / 判定的货物。"
+            "这部分库存暂不进入可销售库存。"
+            "后续可以根据复检结果转入 WH-SPEC、转回 WH-ORDER，或进入 SCRAP。"
+        )
+
+        if stock_df.empty:
+            st.info("当前没有退货暂存库存。")
+        else:
+            return_hold_df = stock_df[
+                stock_df["stock_type"] == "退货暂存"
+            ].copy()
+
+            if return_hold_df.empty:
+                st.info("当前没有 RETURN-HOLD 暂存库存。")
+            else:
+                hold_total = float(
+                    pd.to_numeric(
+                        return_hold_df["lot_total_qty"],
+                        errors="coerce"
+                    ).fillna(0).sum()
+                )
+
+                hold_pending = float(
+                    pd.to_numeric(
+                        return_hold_df.loc[
+                            return_hold_df["release_status"].astype(str).str.lower() == "pending",
+                            "lot_total_qty"
+                        ],
+                        errors="coerce"
+                    ).fillna(0).sum()
+                )
+
+                hold_lot_count = int(return_hold_df["inventory_lot_id"].nunique())
+
+                h1, h2, h3 = st.columns(3)
+                h1.metric("暂存总数量", f"{hold_total:.0f}")
+                h2.metric("待判定数量", f"{hold_pending:.0f}")
+                h3.metric("暂存 Lot 数", hold_lot_count)
+
+                st.markdown("---")
+
+                return_hold_cols = [
+                    "inventory_lot_id",
+                    "lot_code",
+                    "product_name",
+                    "product_code",
+                    "display_spec_code",
+                    "spec_desc",
+                    "variant_label",
+                    "display_special_process",
+                    "display_material",
+                    "location",
+                    "available_qty",
+                    "reserved_qty",
+                    "lot_total_qty",
+                    "lot_status",
+                    "release_status",
+                    "batch_code",
+                    "po_no",
+                    "customer_name",
+                    "trace_key",
+                    "last_out_qty",
+                    "last_out_time",
+                ]
+
+                existing_return_hold_cols = [
+                    c for c in return_hold_cols
+                    if c in return_hold_df.columns
+                ]
+
+                show_df(return_hold_df[existing_return_hold_cols].rename(columns={
+                    "inventory_lot_id": "Lot编号",
+                    "lot_code": "Lot号",
+                    "product_name": "产品名称",
+                    "product_code": "产品编号",
+                    "display_spec_code": "产品规格",
+                    "spec_desc": "规格描述",
+                    "variant_label": "工艺 / 材质",
+                    "display_special_process": "特殊工艺",
+                    "display_material": "材质",
+                    "location": "库位",
+                    "available_qty": "暂存数量",
+                    "reserved_qty": "预留数量",
+                    "lot_total_qty": "总数量",
+                    "lot_status": "Lot状态",
+                    "release_status": "放行状态",
+                    "batch_code": "来源生产批号",
+                    "po_no": "来源PO",
+                    "customer_name": "来源客户",
+                    "trace_key": "Trace Key",
+                    "last_out_qty": "最近出库数量",
+                    "last_out_time": "最近出库时间",
+                }), hide_index=True)
+
+    # =========================
+    # 4.5 报废库存 SCRAP
+    # =========================
+    with tab_scrap:
+        st.subheader("报废库存 SCRAP")
+
+        st.error(
+            "SCRAP 用于存放复检不合格、报废或不可销售的货物。"
+            "这部分库存不应参与销售出货，只用于质量追溯、损耗统计和责任分析。"
+        )
+
+        if stock_df.empty:
+            st.info("当前没有报废库存。")
+        else:
+            scrap_df = stock_df[
+                stock_df["stock_type"] == "报废库存"
+            ].copy()
+
+            if scrap_df.empty:
+                st.info("当前没有 SCRAP 报废库存。")
+            else:
+                scrap_total = float(
+                    pd.to_numeric(
+                        scrap_df["lot_total_qty"],
+                        errors="coerce"
+                    ).fillna(0).sum()
+                )
+
+                scrap_lot_count = int(scrap_df["inventory_lot_id"].nunique())
+
+                rejected_qty = float(
+                    pd.to_numeric(
+                        scrap_df.loc[
+                            scrap_df["release_status"].astype(str).str.lower().isin(["rejected", "scrapped"]),
+                            "lot_total_qty"
+                        ],
+                        errors="coerce"
+                    ).fillna(0).sum()
+                )
+
+                s1, s2, s3 = st.columns(3)
+                s1.metric("报废总数量", f"{scrap_total:.0f}")
+                s2.metric("报废 Lot 数", scrap_lot_count)
+                s3.metric("已判定不合格数量", f"{rejected_qty:.0f}")
+
+                st.markdown("---")
+
+                scrap_cols = [
+                    "inventory_lot_id",
+                    "lot_code",
+                    "product_name",
+                    "product_code",
+                    "display_spec_code",
+                    "spec_desc",
+                    "variant_label",
+                    "display_special_process",
+                    "display_material",
+                    "location",
+                    "available_qty",
+                    "reserved_qty",
+                    "lot_total_qty",
+                    "lot_status",
+                    "release_status",
+                    "batch_code",
+                    "po_no",
+                    "customer_name",
+                    "trace_key",
+                    "last_out_qty",
+                    "last_out_time",
+                ]
+
+                existing_scrap_cols = [
+                    c for c in scrap_cols
+                    if c in scrap_df.columns
+                ]
+
+                show_df(scrap_df[existing_scrap_cols].rename(columns={
+                    "inventory_lot_id": "Lot编号",
+                    "lot_code": "Lot号",
+                    "product_name": "产品名称",
+                    "product_code": "产品编号",
+                    "display_spec_code": "产品规格",
+                    "spec_desc": "规格描述",
+                    "variant_label": "工艺 / 材质",
+                    "display_special_process": "特殊工艺",
+                    "display_material": "材质",
+                    "location": "库位",
+                    "available_qty": "报废数量",
+                    "reserved_qty": "预留数量",
+                    "lot_total_qty": "总数量",
+                    "lot_status": "Lot状态",
+                    "release_status": "放行状态",
+                    "batch_code": "来源生产批号",
+                    "po_no": "来源PO",
+                    "customer_name": "来源客户",
+                    "trace_key": "SCRAP Trace Key",
+                    "last_out_qty": "最近出库数量",
+                    "last_out_time": "最近出库时间",
+                }), hide_index=True)
+
+                st.markdown("---")
+                st.info(
+                    "如果后续需要更严谨的报废管理，可以继续增加："
+                    "报废原因分类、责任部门、复检人、审批人、报废确认单、损耗金额统计等字段。"
+                )
+
+    # =========================
+    # 4.6 库存流水
     # =========================
     with tab_txn:
         st.subheader("库存流水")
@@ -22109,6 +23300,7 @@ def main():
             "仓储总看板",
             "库存",
             "退货再上架",
+            "退货暂存处理",
         ],
         "出货追踪": [
              "出货追踪中心",
@@ -22249,6 +23441,9 @@ def main():
 
     elif page == "退货再上架":
         page_return_restock_to_spec_inventory(conn)
+
+    elif page == "退货暂存处理":
+         page_return_hold_processing(conn)
 
     elif page == "出货追踪中心":
         page_outbound_tracking_center(conn)
