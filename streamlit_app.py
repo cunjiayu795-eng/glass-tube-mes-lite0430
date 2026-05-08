@@ -681,23 +681,74 @@ def display_special_process_label(v):
 
     return value
 
-
 def normalize_material_value(v, default="UNKNOWN_MATERIAL"):
     """
-    材质统一函数。
+    材质统一函数｜升级版
+
+    目标：
+    1. 新录入时实时修复材质拼写
+    2. 避免 SPDA-LIME / spda-lime 再进入系统
+    3. UNKNOWN-MATERIAL / UNKNOWN MATERIAL 统一为 UNKNOWN_MATERIAL
+    4. 与 canonical_material_value() 保持一致
+
+    统一规则示例：
+    - SPDA-LIME / SPDA LIME / spda-lime  → SODA-LIME
+    - SODA LIME / SODA_LIME / SODALIME   → SODA-LIME
+    - BORO / BORO-SILICATE               → BOROSILICATE
+    - QURATZ / QUARZ                     → QUARTZ
+    - UNKNOWN-MATERIAL / UNKNOWN MATERIAL → UNKNOWN_MATERIAL
     """
+
+    # 如果你已经定义了 canonical_material_value()，优先复用它
+    if "canonical_material_value" in globals():
+        try:
+            return canonical_material_value(v, default=default)
+        except Exception:
+            pass
+
     try:
         text = normalize_text(v)
     except Exception:
         text = "" if v is None else str(v).strip()
 
-    text = str(text).strip()
+    text = "" if text is None else str(text).strip()
 
     if not text:
         return default
 
-    return text.upper()
+    raw_upper = text.upper().strip()
+    raw_upper = raw_upper.replace("–", "-").replace("—", "-")
 
+    material_map = {
+        # SODA-LIME 常见错误 / 变体
+        "SPDA-LIME": "SODA-LIME",
+        "SPDA LIME": "SODA-LIME",
+        "SPDA_LIME": "SODA-LIME",
+        "SPDALIME": "SODA-LIME",
+        "SODA LIME": "SODA-LIME",
+        "SODA_LIME": "SODA-LIME",
+        "SODALIME": "SODA-LIME",
+
+        # BOROSILICATE 常见变体
+        "BORO": "BOROSILICATE",
+        "BORO-SILICATE": "BOROSILICATE",
+        "BORO SILICATE": "BOROSILICATE",
+        "BOROSILICATE GLASS": "BOROSILICATE",
+
+        # QUARTZ 常见拼写错误
+        "QURATZ": "QUARTZ",
+        "QUARZ": "QUARTZ",
+        "QUARTZ GLASS": "QUARTZ",
+
+        # UNKNOWN 统一
+        "UNKNOWN": "UNKNOWN_MATERIAL",
+        "UNKNOWN-MATERIAL": "UNKNOWN_MATERIAL",
+        "UNKNOWN MATERIAL": "UNKNOWN_MATERIAL",
+        "UNKNOWNMATERIAL": "UNKNOWN_MATERIAL",
+        "UNKNOWN_MATERIAL": "UNKNOWN_MATERIAL",
+    }
+
+    return material_map.get(raw_upper, raw_upper)
 
 def normalize_trace_part(v, default="NA"):
     """
@@ -10755,84 +10806,364 @@ def push_delivery_plan_to_production(conn, delivery_plan_id):
         action_choice="自动判断"
     )
 
+
 def page_sales_dashboard(conn):
-    st.header("销售｜销售看板")
+    """
+    销售看板
+
+    修正版重点：
+    1. 销售看板中的 WH-SPEC 规格化库存计算，统一使用：
+       产品规格 + 特殊工艺 + 材质
+    2. 兼容旧 Trace Key：
+       - STANDARD / 无 / 无特殊工艺 → STANDARD
+       - SPDA-LIME / spda-lime → SODA-LIME
+       - UNKNOWN-MATERIAL → UNKNOWN_MATERIAL
+    3. 不再只用 trace_key = SPEC_STOCK__... 精确匹配，
+       避免漏掉旧订单退货再上架、旧批次转入 WH-SPEC 的库存。
+    4. 销售看板会显示：
+       - 计划交付数量
+       - 已交付数量
+       - 剩余待满足
+       - 成品缺口
+       - WH-ORDER 订单库存
+       - WH-SPEC 规格化库存
+       - 成品库存合计
+       - 半成品数量
+       - 是否需要生产
+       - 是否需要半成品出库
+    """
+
+    st.header("销售看板")
 
     st.info(
-        "销售看板规则：订单优先匹配成品库存。"
-        "若成品库存充足，直接进入【发货准备】；"
-        "若成品库存不足，由销售端人工勾选【需要安排生产】和 / 或【需要半成品出库】。"
+        "销售看板用于判断每个交付批次是否已有足够库存满足出货。"
+        "系统会优先查看订单库存 WH-ORDER，再查看规格化库存 WH-SPEC。"
+        "其中 WH-SPEC 会按【产品规格 + 特殊工艺 + 材质】统一匹配，"
+        "与库存页面的规格化库存查询口径保持一致。"
     )
 
     # =========================
-    # 1. 交付批次总览
+    # 0. 内部安全函数
+    # =========================
+    def _safe_text(v, default=""):
+        try:
+            value = normalize_text(v)
+        except Exception:
+            value = "" if v is None else str(v).strip()
+
+        value = "" if value is None else str(value).strip()
+        return value if value else default
+
+    def _safe_float(v, default=0.0):
+        try:
+            if pd.isna(v):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    def _normalize_spec(v):
+        value = _safe_text(v)
+        return value.upper().strip() if value else "UNKNOWN_SPEC"
+
+    def _normalize_process(v):
+        if "normalize_special_process_value" in globals():
+            return normalize_special_process_value(v)
+
+        value = _safe_text(v).upper().strip()
+
+        if value in [
+            "",
+            "NONE",
+            "NO",
+            "N/A",
+            "NA",
+            "无",
+            "无特殊工艺",
+            "STANDARD",
+            "STANDARD（无特殊工艺）",
+            "STANDARD(无特殊工艺)",
+        ]:
+            return "STANDARD"
+
+        return value
+
+    def _display_process(v):
+        if "display_special_process_label" in globals():
+            return display_special_process_label(v)
+
+        value = _normalize_process(v)
+
+        if value == "STANDARD":
+            return "STANDARD（无特殊工艺）"
+
+        return value
+
+    def _normalize_material(v):
+        if "normalize_material_value" in globals():
+            return normalize_material_value(v)
+
+        value = _safe_text(v).upper().strip()
+
+        material_map = {
+            "SPDA-LIME": "SODA-LIME",
+            "SPDA LIME": "SODA-LIME",
+            "SPDA_LIME": "SODA-LIME",
+            "SPDALIME": "SODA-LIME",
+            "SODA LIME": "SODA-LIME",
+            "SODA_LIME": "SODA-LIME",
+            "SODALIME": "SODA-LIME",
+            "UNKNOWN-MATERIAL": "UNKNOWN_MATERIAL",
+            "UNKNOWN MATERIAL": "UNKNOWN_MATERIAL",
+            "UNKNOWNMATERIAL": "UNKNOWN_MATERIAL",
+            "UNKNOWN": "UNKNOWN_MATERIAL",
+        }
+
+        return material_map.get(value, value if value else "UNKNOWN_MATERIAL")
+
+    def _parse_inventory_variant(row):
+        """
+        解析库存 Lot 的规格 / 工艺 / 材质。
+
+        优先级：
+        1. trace_key 解析结果
+        2. product_spec.spec_code
+        3. order_item.product_spec_text
+        4. production_batch / order_item 的 special_process, material
+        """
+        parsed_spec = ""
+        parsed_process = ""
+        parsed_material = ""
+
+        trace_key = _safe_text(row.get("trace_key"))
+
+        if "parse_inventory_variant_from_trace_key" in globals():
+            try:
+                parsed = parse_inventory_variant_from_trace_key(trace_key)
+
+                if isinstance(parsed, dict):
+                    parsed_spec = _safe_text(parsed.get("parsed_spec_code"))
+                    parsed_process = _safe_text(parsed.get("parsed_special_process"))
+                    parsed_material = _safe_text(parsed.get("parsed_material"))
+            except Exception:
+                pass
+
+        final_spec = (
+            parsed_spec
+            or _safe_text(row.get("spec_code"))
+            or _safe_text(row.get("product_spec_text"))
+        )
+
+        final_process = (
+            parsed_process
+            or _safe_text(row.get("raw_special_process"))
+            or _safe_text(row.get("special_process"))
+            or "STANDARD"
+        )
+
+        final_material = (
+            parsed_material
+            or _safe_text(row.get("raw_material"))
+            or _safe_text(row.get("material"))
+            or "UNKNOWN_MATERIAL"
+        )
+
+        return {
+            "spec_code_norm": _normalize_spec(final_spec),
+            "special_process_norm": _normalize_process(final_process),
+            "material_norm": _normalize_material(final_material),
+        }
+
+    def _get_available_wh_spec_qty_by_variant(spec_id, spec_code, special_process, material):
+        """
+        销售看板专用：按 产品规格 + 特殊工艺 + 材质 统一计算 WH-SPEC 可用库存。
+
+        这个函数和库存页面口径一致：
+        - 先查同 spec_id 的 WH-SPEC Lot
+        - 再解析 trace_key
+        - 再统一规格 / 工艺 / 材质
+        - 最后汇总 available_qty
+        """
+
+        target_spec = _normalize_spec(spec_code)
+        target_process = _normalize_process(special_process)
+        target_material = _normalize_material(material)
+
+        raw_df = pd.read_sql_query("""
+            SELECT
+                il.inventory_lot_id,
+                il.lot_code,
+                il.trace_key,
+                il.location,
+                il.product_id,
+                il.spec_id,
+                il.production_batch_id,
+
+                COALESCE(il.available_qty, 0) AS available_qty,
+                COALESCE(il.reserved_qty, 0) AS reserved_qty,
+                COALESCE(il.lot_status, 'available') AS lot_status,
+                COALESCE(il.release_status, 'released') AS release_status,
+
+                ps.spec_code,
+                ps.spec_desc,
+
+                pb.batch_code,
+                COALESCE(pb.special_process, oi.special_process, 'STANDARD') AS raw_special_process,
+                COALESCE(pb.material, oi.material, 'UNKNOWN_MATERIAL') AS raw_material,
+
+                oi.po_no,
+                oi.product_spec_text,
+                oi.special_process,
+                oi.material
+
+            FROM inventory_lot il
+            LEFT JOIN product_spec ps
+                ON il.spec_id = ps.spec_id
+            LEFT JOIN production_batch pb
+                ON il.production_batch_id = pb.production_batch_id
+            LEFT JOIN production_schedule sch
+                ON pb.production_batch_id = sch.production_batch_id
+            LEFT JOIN order_item oi
+                ON sch.order_item_id = oi.order_item_id
+
+            WHERE il.location = 'WH-SPEC'
+              AND il.spec_id = ?
+              AND COALESCE(il.available_qty, 0) > 0
+              AND COALESCE(il.release_status, 'released') = 'released'
+              AND COALESCE(il.lot_status, 'available') IN ('available', 'partial')
+        """, conn, params=[int(spec_id)])
+
+        if raw_df.empty:
+            return 0.0, raw_df
+
+        df = raw_df.copy()
+
+        parsed_records = df.apply(_parse_inventory_variant, axis=1)
+
+        df["spec_code_norm"] = parsed_records.apply(lambda x: x["spec_code_norm"])
+        df["special_process_norm"] = parsed_records.apply(lambda x: x["special_process_norm"])
+        df["material_norm"] = parsed_records.apply(lambda x: x["material_norm"])
+
+        matched_df = df[
+            (df["spec_code_norm"] == target_spec)
+            &
+            (df["special_process_norm"] == target_process)
+            &
+            (df["material_norm"] == target_material)
+        ].copy()
+
+        if matched_df.empty:
+            return 0.0, matched_df
+
+        qty = float(
+            pd.to_numeric(
+                matched_df["available_qty"],
+                errors="coerce"
+            ).fillna(0).sum()
+        )
+
+        return qty, matched_df
+
+    def _get_available_wh_order_qty(order_trace_key):
+        """
+        订单库存 WH-ORDER：
+        仍然严格按订单 Trace Key 查询。
+        """
+        df = pd.read_sql_query("""
+            SELECT
+                COALESCE(SUM(available_qty), 0) AS qty
+            FROM inventory_lot
+            WHERE location = 'WH-ORDER'
+              AND trace_key = ?
+              AND COALESCE(available_qty, 0) > 0
+              AND COALESCE(release_status, 'released') = 'released'
+              AND COALESCE(lot_status, 'available') IN ('available', 'partial')
+        """, conn, params=[_safe_text(order_trace_key)])
+
+        if df.empty:
+            return 0.0
+
+        return _safe_float(df.iloc[0]["qty"])
+
+    def _get_semi_finished_qty(production_batch_id):
+        """
+        半成品数量：
+        用于判断是否可以进入质检 / 入库。
+        如果你的系统里半成品库存字段不同，可以按你现有字段调整。
+        """
+        if production_batch_id is None or pd.isna(production_batch_id):
+            return 0.0
+
+        try:
+            df = pd.read_sql_query("""
+                SELECT
+                    COALESCE(SUM(semi_finished_wh_qty), 0) AS qty
+                FROM production_batch
+                WHERE production_batch_id = ?
+            """, conn, params=[int(production_batch_id)])
+
+            if df.empty:
+                return 0.0
+
+            return _safe_float(df.iloc[0]["qty"])
+
+        except Exception:
+            return 0.0
+
+    # =========================
+    # 1. 读取交付批次销售看板基础数据
     # =========================
     dashboard_df = pd.read_sql_query("""
         SELECT
             dp.delivery_plan_id,
             dp.order_item_id,
             COALESCE(dp.delivery_batch_no, 1) AS delivery_batch_no,
-            dp.planned_delivery_date,
             COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
             COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
-            COALESCE(dp.planned_delivery_qty, 0) - COALESCE(dp.actual_delivery_qty, 0) AS remaining_qty,
             COALESCE(dp.delivery_status, '未排产') AS delivery_status,
+            dp.planned_delivery_date,
+            dp.actual_delivery_date,
 
-            COALESCE(dp.sales_need_production, 0) AS sales_need_production,
-            COALESCE(dp.sales_need_semi_out, 0) AS sales_need_semi_out,
-            dp.sales_decision_note,
-            dp.sales_decision_time,
-
-            c.customer_name,
+            oi.order_id,
+            oi.product_id,
+            oi.spec_id,
             oi.po_no,
-            oi.customer_pn,
+            oi.trace_key,
             oi.product_type_text,
             oi.product_spec_text,
             COALESCE(oi.special_process, 'STANDARD') AS special_process,
             COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
-            oi.trace_key,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
+
+            o.order_status,
+            o.order_date,
+
+            c.customer_id,
+            c.customer_name,
+
+            p.product_code,
+            p.product_name,
+
+            ps.spec_code,
+            ps.spec_desc,
+
+            pb.production_batch_id,
+            pb.batch_code,
+            0 AS batch_planned_qty,
+            0 AS batch_actual_qty,
+            COALESCE(pb.semi_finished_wh_qty, 0) AS semi_finished_wh_qty,
+            COALESCE(pb.production_flow_status, '') AS production_flow_status,
 
             COALESCE((
-                SELECT SUM(COALESCE(il1.available_qty, 0))
-                FROM inventory_lot il1
-                WHERE il1.trace_key = oi.trace_key
-                  AND il1.location = 'WH-ORDER'
-                  AND lower(COALESCE(il1.release_status, 'pending')) = 'released'
-                  AND COALESCE(il1.lot_status, 'available') = 'available'
-            ), 0) AS order_finished_qty,
-
-            COALESCE((
-                SELECT SUM(COALESCE(il2.available_qty, 0))
-                FROM inventory_lot il2
-                WHERE il2.location = 'WH-SPEC'
-                  AND lower(COALESCE(il2.release_status, 'pending')) = 'released'
-                  AND COALESCE(il2.lot_status, 'available') = 'available'
-                  AND (
-                        il2.trace_key = oi.trace_key
-                        OR il2.trace_key = (
-                            'SPEC_STOCK' || '__' ||
-                            UPPER(REPLACE(REPLACE(COALESCE(oi.product_spec_text, 'NOSPEC'), '__', '-'), ' ', '-')) || '__' ||
-                            UPPER(REPLACE(REPLACE(COALESCE(oi.special_process, 'STANDARD'), '__', '-'), ' ', '-')) || '__' ||
-                            UPPER(REPLACE(REPLACE(COALESCE(oi.material, 'UNKNOWN_MATERIAL'), '__', '-'), ' ', '-'))
-                        )
-                  )
-            ), 0) AS spec_finished_qty,
-
-            COALESCE((
-                SELECT SUM(COALESCE(pb2.semi_finished_wh_qty, 0))
-                FROM production_batch pb2
-                LEFT JOIN production_schedule ps2
-                    ON pb2.production_batch_id = ps2.production_batch_id
-                LEFT JOIN delivery_plan dp2
-                    ON ps2.delivery_plan_id = dp2.delivery_plan_id
-                WHERE pb2.trace_key = oi.trace_key
-                  AND COALESCE(pb2.semi_finished_wh_qty, 0) > 0
-                  AND COALESCE(dp2.delivery_status, '') NOT IN (
-                        '已入库',
-                        '已出货',
-                        '部分出货'
-                  )
-            ), 0) AS semi_finished_qty
+                SELECT SUM(COALESCE(il.available_qty, 0))
+                FROM inventory_lot il
+                WHERE il.location = 'WH-ORDER'
+                  AND il.trace_key = oi.trace_key
+                  AND COALESCE(il.available_qty, 0) > 0
+                  AND COALESCE(il.release_status, 'released') = 'released'
+                  AND COALESCE(il.lot_status, 'available') IN ('available', 'partial')
+            ), 0) AS wh_order_qty_sql
 
         FROM delivery_plan dp
         JOIN order_item oi
@@ -10841,345 +11172,601 @@ def page_sales_dashboard(conn):
             ON oi.order_id = o.order_id
         JOIN customer c
             ON o.customer_id = c.customer_id
+        LEFT JOIN product p
+            ON oi.product_id = p.product_id
+        LEFT JOIN product_spec ps
+            ON oi.spec_id = ps.spec_id
+        LEFT JOIN production_schedule sch
+            ON dp.delivery_plan_id = sch.delivery_plan_id
+        LEFT JOIN production_batch pb
+            ON sch.production_batch_id = pb.production_batch_id
+
         ORDER BY
             CASE COALESCE(dp.delivery_status, '未排产')
                 WHEN '未排产' THEN 1
-                WHEN '发货准备' THEN 2
-                WHEN '待生产确认' THEN 3
-                WHEN '半成品出库准备' THEN 4
-                WHEN '已排产' THEN 5
-                WHEN '生产中' THEN 6
-                WHEN '质检中' THEN 7
-                WHEN '待入库确认' THEN 8
-                WHEN '已入库' THEN 9
-                WHEN '部分出货' THEN 10
-                WHEN '已出货' THEN 11
-                ELSE 99
+                WHEN '已排产' THEN 2
+                WHEN '生产中' THEN 3
+                WHEN '已入库' THEN 4
+                WHEN '发货准备' THEN 5
+                WHEN '部分出货' THEN 6
+                WHEN '已出货' THEN 7
+                ELSE 9
             END,
             dp.planned_delivery_date,
-            dp.delivery_plan_id
+            dp.delivery_plan_id DESC
     """, conn)
 
     if dashboard_df.empty:
         st.info("当前没有交付批次数据。")
         return
 
-    dashboard_df["total_finished_qty"] = (
-        pd.to_numeric(dashboard_df["order_finished_qty"], errors="coerce").fillna(0)
-        + pd.to_numeric(dashboard_df["spec_finished_qty"], errors="coerce").fillna(0)
-    )
+    dashboard_df = dashboard_df.copy()
 
-    dashboard_df["finished_shortage_qty"] = (
-        pd.to_numeric(dashboard_df["remaining_qty"], errors="coerce").fillna(0)
-        - pd.to_numeric(dashboard_df["total_finished_qty"], errors="coerce").fillna(0)
+    # =========================
+    # 2. 统一字段与库存计算
+    # =========================
+    dashboard_df["planned_delivery_qty"] = pd.to_numeric(
+        dashboard_df["planned_delivery_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    dashboard_df["actual_delivery_qty"] = pd.to_numeric(
+        dashboard_df["actual_delivery_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    dashboard_df["remaining_qty"] = (
+        dashboard_df["planned_delivery_qty"]
+        - dashboard_df["actual_delivery_qty"]
     ).clip(lower=0)
 
-    # =========================
-    # 2. 顶部指标
-    # =========================
-    total_wait_qty = pd.to_numeric(
-        dashboard_df["remaining_qty"],
-        errors="coerce"
-    ).fillna(0).sum()
+    dashboard_df["special_process_norm"] = dashboard_df["special_process"].apply(_normalize_process)
+    dashboard_df["material_norm"] = dashboard_df["material"].apply(_normalize_material)
+    dashboard_df["spec_code_norm"] = dashboard_df["spec_code"].apply(_normalize_spec)
 
-    ready_count = len(dashboard_df[dashboard_df["delivery_status"] == "发货准备"])
-    production_wait_count = len(
-        dashboard_df[
-            (dashboard_df["delivery_status"] == "待生产确认")
-            | (dashboard_df["sales_need_production"] == 1)
-        ]
-    )
-    semi_wait_count = len(
-        dashboard_df[
-            (dashboard_df["delivery_status"] == "半成品出库准备")
-            | (dashboard_df["sales_need_semi_out"] == 1)
-        ]
+    dashboard_df["special_process_display"] = dashboard_df["special_process_norm"].apply(_display_process)
+
+    wh_order_qty_list = []
+    wh_spec_qty_list = []
+    wh_spec_lot_count_list = []
+    semi_finished_qty_list = []
+
+    for _, row in dashboard_df.iterrows():
+        wh_order_qty = _get_available_wh_order_qty(row.get("trace_key"))
+
+        wh_spec_qty, wh_spec_match_df = _get_available_wh_spec_qty_by_variant(
+            spec_id=int(row["spec_id"]),
+            spec_code=row.get("spec_code"),
+            special_process=row.get("special_process"),
+            material=row.get("material")
+        )
+
+        if wh_spec_match_df is not None and not wh_spec_match_df.empty:
+            wh_spec_lot_count = int(wh_spec_match_df["inventory_lot_id"].nunique())
+        else:
+            wh_spec_lot_count = 0
+
+        semi_finished_qty = _safe_float(row.get("semi_finished_wh_qty"))
+
+        wh_order_qty_list.append(wh_order_qty)
+        wh_spec_qty_list.append(wh_spec_qty)
+        wh_spec_lot_count_list.append(wh_spec_lot_count)
+        semi_finished_qty_list.append(semi_finished_qty)
+
+    dashboard_df["wh_order_qty"] = wh_order_qty_list
+    dashboard_df["wh_spec_qty"] = wh_spec_qty_list
+    dashboard_df["wh_spec_lot_count"] = wh_spec_lot_count_list
+    dashboard_df["semi_finished_qty"] = semi_finished_qty_list
+
+    dashboard_df["finished_stock_total"] = (
+        dashboard_df["wh_order_qty"]
+        + dashboard_df["wh_spec_qty"]
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("待满足数量", f"{float(total_wait_qty):.0f}")
-    m2.metric("发货准备批次", ready_count)
-    m3.metric("待生产确认 / 生产需求", production_wait_count)
-    m4.metric("半成品出库需求", semi_wait_count)
+    dashboard_df["finished_gap"] = (
+        dashboard_df["remaining_qty"]
+        - dashboard_df["finished_stock_total"]
+    ).clip(lower=0)
+
+    dashboard_df["need_production"] = dashboard_df["finished_gap"].apply(
+        lambda x: "是" if _safe_float(x) > 0 else "否"
+    )
+
+    dashboard_df["need_semi_finished_outbound"] = dashboard_df.apply(
+        lambda r: "是"
+        if _safe_float(r["finished_gap"]) > 0
+        and _safe_float(r["semi_finished_qty"]) > 0
+        else "否",
+        axis=1
+    )
+
+    dashboard_df["sales_action"] = dashboard_df.apply(
+        lambda r: (
+            "库存足够，可推送至出货管理"
+            if _safe_float(r["finished_stock_total"]) >= _safe_float(r["remaining_qty"])
+            and _safe_float(r["remaining_qty"]) > 0
+            else (
+                "已完成出货"
+                if _safe_float(r["remaining_qty"]) <= 0
+                else (
+                    "成品不足，可检查半成品 / 安排生产"
+                    if _safe_float(r["finished_gap"]) > 0
+                    else "待处理"
+                )
+            )
+        ),
+        axis=1
+    )
+
+    # =========================
+    # 3. 顶部指标
+    # =========================
+    total_plans = int(dashboard_df["delivery_plan_id"].nunique())
+    pending_plans = int((dashboard_df["remaining_qty"] > 0).sum())
+    stock_ready_plans = int(
+        (
+            (dashboard_df["remaining_qty"] > 0)
+            &
+            (dashboard_df["finished_stock_total"] >= dashboard_df["remaining_qty"])
+        ).sum()
+    )
+    shortage_plans = int(
+        (
+            (dashboard_df["remaining_qty"] > 0)
+            &
+            (dashboard_df["finished_stock_total"] < dashboard_df["remaining_qty"])
+        ).sum()
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("交付批次数", total_plans)
+    k2.metric("待满足批次", pending_plans)
+    k3.metric("库存足够批次", stock_ready_plans)
+    k4.metric("成品缺口批次", shortage_plans)
 
     st.markdown("---")
 
-    st.subheader("交付批次总览")
+    # =========================
+    # 4. 筛选区
+    # =========================
+    st.subheader("销售交付筛选")
 
-    show_df(dashboard_df.rename(columns={
-        "delivery_plan_id": "交付计划编号",
-        "order_item_id": "订单明细编号",
-        "delivery_batch_no": "交付批次",
-        "planned_delivery_date": "计划交付日期",
-        "planned_delivery_qty": "计划交付数量",
-        "actual_delivery_qty": "实际交付数量",
-        "remaining_qty": "剩余待满足数量",
-        "delivery_status": "交付状态",
-        "sales_need_production": "销售要求生产",
-        "sales_need_semi_out": "销售要求半成品出库",
-        "sales_decision_note": "销售处理说明",
-        "sales_decision_time": "销售处理时间",
+    status_options = ["全部"] + sorted(
+        dashboard_df["delivery_status"]
+        .fillna("未排产")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    action_options = ["全部"] + sorted(
+        dashboard_df["sales_action"]
+        .fillna("待处理")
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    customer_options = ["全部"] + sorted(
+        dashboard_df["customer_name"]
+        .fillna("")
+        .astype(str)
+        .replace("", pd.NA)
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    f1, f2, f3 = st.columns(3)
+
+    with f1:
+        selected_status = st.selectbox(
+            "交付状态",
+            status_options,
+            key="sales_dashboard_status_filter"
+        )
+
+    with f2:
+        selected_action = st.selectbox(
+            "处理建议",
+            action_options,
+            key="sales_dashboard_action_filter"
+        )
+
+    with f3:
+        selected_customer = st.selectbox(
+            "客户",
+            customer_options,
+            key="sales_dashboard_customer_filter"
+        )
+
+    keyword = st.text_input(
+        "快速搜索：客户 / PO / Trace Key / 产品 / 规格",
+        key="sales_dashboard_keyword"
+    )
+
+    filtered_df = dashboard_df.copy()
+
+    if selected_status != "全部":
+        filtered_df = filtered_df[
+            filtered_df["delivery_status"].astype(str) == selected_status
+        ]
+
+    if selected_action != "全部":
+        filtered_df = filtered_df[
+            filtered_df["sales_action"].astype(str) == selected_action
+        ]
+
+    if selected_customer != "全部":
+        filtered_df = filtered_df[
+            filtered_df["customer_name"].astype(str) == selected_customer
+        ]
+
+    if keyword.strip():
+        keyword_upper = keyword.strip().upper()
+
+        search_cols = [
+            "customer_name",
+            "po_no",
+            "trace_key",
+            "product_name",
+            "product_code",
+            "spec_code",
+            "spec_desc",
+            "special_process_norm",
+            "material_norm",
+        ]
+
+        mask = False
+
+        for col in search_cols:
+            if col in filtered_df.columns:
+                mask = mask | filtered_df[col].astype(str).str.upper().str.contains(
+                    keyword_upper,
+                    na=False
+                )
+
+        filtered_df = filtered_df[mask]
+
+    if filtered_df.empty:
+        st.warning("当前筛选条件下没有销售交付记录。")
+        return
+
+    # =========================
+    # 5. 销售总览表
+    # =========================
+    st.markdown("#### 销售交付总览")
+
+    show_cols = [
+        "delivery_plan_id",
+        "customer_name",
+        "po_no",
+        "delivery_batch_no",
+        "delivery_status",
+        "planned_delivery_qty",
+        "actual_delivery_qty",
+        "remaining_qty",
+        "wh_order_qty",
+        "wh_spec_qty",
+        "wh_spec_lot_count",
+        "finished_stock_total",
+        "finished_gap",
+        "semi_finished_qty",
+        "need_production",
+        "need_semi_finished_outbound",
+        "sales_action",
+        "product_name",
+        "product_code",
+        "spec_code_norm",
+        "spec_desc",
+        "special_process_display",
+        "material_norm",
+        "planned_delivery_date",
+        "trace_key",
+    ]
+
+    existing_cols = [
+        c for c in show_cols
+        if c in filtered_df.columns
+    ]
+
+    show_df(filtered_df[existing_cols].rename(columns={
+        "delivery_plan_id": "交付批次ID",
         "customer_name": "客户",
         "po_no": "PO",
-        "customer_pn": "客户料号",
-        "product_type_text": "产品",
-        "product_spec_text": "规格",
-        "special_process": "特殊工艺",
-        "material": "材质",
-        "order_finished_qty": "订单成品库存",
-        "spec_finished_qty": "规格成品库存",
-        "total_finished_qty": "成品库存合计",
-        "finished_shortage_qty": "成品缺口",
+        "delivery_batch_no": "交付批次",
+        "delivery_status": "交付状态",
+        "planned_delivery_qty": "计划交付数量",
+        "actual_delivery_qty": "已交付数量",
+        "remaining_qty": "剩余待满足",
+        "wh_order_qty": "订单成品库存 WH-ORDER",
+        "wh_spec_qty": "规格成品库存 WH-SPEC",
+        "wh_spec_lot_count": "WH-SPEC Lot数",
+        "finished_stock_total": "成品库存合计",
+        "finished_gap": "成品缺口",
         "semi_finished_qty": "半成品数量",
-        "trace_key": "Trace Key"
+        "need_production": "销售要求生产",
+        "need_semi_finished_outbound": "销售要求半成品出库",
+        "sales_action": "销售处理建议",
+        "product_name": "产品",
+        "product_code": "产品编号",
+        "spec_code_norm": "规格",
+        "spec_desc": "规格描述",
+        "special_process_display": "特殊工艺",
+        "material_norm": "材质",
+        "planned_delivery_date": "计划交付日期",
+        "trace_key": "Trace Key",
     }), hide_index=True)
 
     st.markdown("---")
 
     # =========================
-    # 3. 选择交付批次处理
+    # 6. 选择单个交付批次处理
     # =========================
-    selectable_df = dashboard_df[
-        dashboard_df["delivery_status"].isin([
-            "未排产",
-            "发货准备",
-            "待生产确认",
-            "半成品出库准备"
-        ])
-    ].copy()
+    st.subheader("选择交付批次进行处理")
 
-    if selectable_df.empty:
-        st.info("当前没有需要销售处理的交付批次。")
-        return
+    filtered_df = filtered_df.reset_index(drop=True)
 
-    selected_delivery_plan_id = st.selectbox(
-        "选择交付批次进行处理",
-        selectable_df["delivery_plan_id"].tolist(),
-        format_func=lambda x: (
-            f"【{selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'delivery_status'].iloc[0]}】 "
-            f"交付计划 {x} | "
-            f"PO {selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'po_no'].iloc[0]} | "
-            f"第 {int(selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'delivery_batch_no'].iloc[0])} 批 | "
-            f"剩余 {float(selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'remaining_qty'].iloc[0] or 0):.0f} | "
-            f"成品 {float(selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'total_finished_qty'].iloc[0] or 0):.0f} | "
-            f"半成品 {float(selectable_df.loc[selectable_df['delivery_plan_id'] == x, 'semi_finished_qty'].iloc[0] or 0):.0f}"
+    selected_idx = st.selectbox(
+        "选择交付批次",
+        filtered_df.index.tolist(),
+        format_func=lambda i: (
+            f"[{filtered_df.loc[i, 'delivery_status']}] "
+            f"交付计划 {int(filtered_df.loc[i, 'delivery_plan_id'])} | "
+            f"PO {filtered_df.loc[i, 'po_no']} | "
+            f"第 {int(filtered_df.loc[i, 'delivery_batch_no'])} 批 | "
+            f"剩余 {float(filtered_df.loc[i, 'remaining_qty']):.0f} | "
+            f"成品 {float(filtered_df.loc[i, 'finished_stock_total']):.0f} | "
+            f"半成品 {float(filtered_df.loc[i, 'semi_finished_qty']):.0f}"
         ),
-        key="sales_dashboard_delivery_plan_select"
+        key="sales_dashboard_selected_delivery_plan"
     )
 
-    selected = selectable_df[
-        selectable_df["delivery_plan_id"] == selected_delivery_plan_id
-    ].iloc[0]
+    row = filtered_df.loc[selected_idx]
 
-    decision = get_delivery_plan_sales_decision(
-        conn,
-        int(selected_delivery_plan_id)
-    )
-
-    if not decision.get("ok"):
-        st.error(decision.get("message", "库存判断失败。"))
-        return
-
-    qty_needed = float(decision["qty_needed"] or 0)
-    order_finished_qty = float(decision["order_finished_qty"] or 0)
-    spec_finished_qty = float(decision["spec_finished_qty"] or 0)
-    total_finished_qty = float(decision["total_finished_qty"] or 0)
-    semi_finished_qty = float(decision["semi_finished_qty"] or 0)
-    shortage_qty = max(qty_needed - total_finished_qty, 0)
-
-    st.subheader("销售处理卡片")
+    st.markdown("#### 销售处理卡片")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("客户", str(selected["customer_name"]))
-    c2.metric("PO", str(selected["po_no"]))
-    c3.metric("交付批次", f"第 {int(selected['delivery_batch_no'])} 批")
-    c4.metric("当前状态", str(selected["delivery_status"]))
+    c1.metric("客户", _safe_text(row.get("customer_name")))
+    c2.metric("PO", _safe_text(row.get("po_no")))
+    c3.metric("交付批次", f"第 {int(row.get('delivery_batch_no'))} 批")
+    c4.metric("当前状态", _safe_text(row.get("delivery_status")))
 
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("计划交付数量", f"{float(selected['planned_delivery_qty'] or 0):.0f}")
-    c6.metric("已交付数量", f"{float(selected['actual_delivery_qty'] or 0):.0f}")
-    c7.metric("剩余待满足", f"{qty_needed:.0f}")
-    c8.metric("成品缺口", f"{shortage_qty:.0f}")
+    c5.metric("计划交付数量", f"{_safe_float(row.get('planned_delivery_qty')):.0f}")
+    c6.metric("已交付数量", f"{_safe_float(row.get('actual_delivery_qty')):.0f}")
+    c7.metric("剩余待满足", f"{_safe_float(row.get('remaining_qty')):.0f}")
+    c8.metric("成品缺口", f"{_safe_float(row.get('finished_gap')):.0f}")
 
     c9, c10, c11, c12 = st.columns(4)
-    c9.metric("订单成品库存 WH-ORDER", f"{order_finished_qty:.0f}")
-    c10.metric("规格成品库存 WH-SPEC", f"{spec_finished_qty:.0f}")
-    c11.metric("成品库存合计", f"{total_finished_qty:.0f}")
-    c12.metric("半成品数量", f"{semi_finished_qty:.0f}")
+    c9.metric("订单成品库存 WH-ORDER", f"{_safe_float(row.get('wh_order_qty')):.0f}")
+    c10.metric("规格成品库存 WH-SPEC", f"{_safe_float(row.get('wh_spec_qty')):.0f}")
+    c11.metric("成品库存合计", f"{_safe_float(row.get('finished_stock_total')):.0f}")
+    c12.metric("半成品数量", f"{_safe_float(row.get('semi_finished_qty')):.0f}")
 
     c13, c14 = st.columns(2)
-    c13.metric("销售要求生产", "是" if int(selected.get("sales_need_production", 0) or 0) == 1 else "否")
-    c14.metric("销售要求半成品出库", "是" if int(selected.get("sales_need_semi_out", 0) or 0) == 1 else "否")
-
-    if pd.notna(selected.get("sales_decision_note", None)) and str(selected.get("sales_decision_note", "")).strip():
-        st.caption(f"销售处理说明：{selected['sales_decision_note']}")
+    c13.metric("销售要求生产", _safe_text(row.get("need_production"), "否"))
+    c14.metric("销售要求半成品出库", _safe_text(row.get("need_semi_finished_outbound"), "否"))
 
     st.caption(
-        f"产品：{selected['product_type_text']} ｜ "
-        f"规格：{selected['product_spec_text']} ｜ "
-        f"特殊工艺：{selected['special_process']} ｜ "
-        f"材质：{selected['material']} ｜ "
-        f"计划交付日期：{selected['planned_delivery_date']}"
+        f"产品：{_safe_text(row.get('product_name'))} | "
+        f"规格：{_safe_text(row.get('spec_code_norm'))} | "
+        f"特殊工艺：{_safe_text(row.get('special_process_display'))} | "
+        f"材质：{_safe_text(row.get('material_norm'))} | "
+        f"计划交付日期：{_safe_text(row.get('planned_delivery_date'))}"
     )
 
     st.markdown("Trace Key")
-    st.code(str(selected["trace_key"]))
+    st.code(_safe_text(row.get("trace_key")))
 
     st.markdown("---")
 
     # =========================
-    # 4. 决策逻辑
+    # 7. WH-SPEC 匹配明细，用于核对库存页和销售页
     # =========================
-    if qty_needed <= 0:
-        st.success("该交付批次已满足，无需继续处理。")
-        return
+    with st.expander("查看本交付批次匹配到的 WH-SPEC Lot 明细"):
+        spec_qty, spec_match_df = _get_available_wh_spec_qty_by_variant(
+            spec_id=int(row["spec_id"]),
+            spec_code=row.get("spec_code"),
+            special_process=row.get("special_process"),
+            material=row.get("material")
+        )
+
+        st.metric("本批次匹配到的 WH-SPEC 可用数量", f"{spec_qty:.0f}")
+
+        if spec_match_df is None or spec_match_df.empty:
+            st.info("当前没有匹配到 WH-SPEC Lot。")
+        else:
+            show_cols = [
+                "inventory_lot_id",
+                "lot_code",
+                "trace_key",
+                "available_qty",
+                "reserved_qty",
+                "lot_status",
+                "release_status",
+                "spec_code_norm",
+                "special_process_norm",
+                "material_norm",
+                "batch_code",
+                "po_no",
+            ]
+
+            existing_cols = [
+                c for c in show_cols
+                if c in spec_match_df.columns
+            ]
+
+            tmp_df = spec_match_df.copy()
+            tmp_df["special_process_display"] = tmp_df["special_process_norm"].apply(_display_process)
+
+            if "special_process_display" not in existing_cols:
+                existing_cols.append("special_process_display")
+
+            show_df(tmp_df[existing_cols].rename(columns={
+                "inventory_lot_id": "Lot编号",
+                "lot_code": "Lot号",
+                "trace_key": "Trace Key",
+                "available_qty": "可用数量",
+                "reserved_qty": "预留数量",
+                "lot_status": "Lot状态",
+                "release_status": "放行状态",
+                "spec_code_norm": "规格",
+                "special_process_norm": "特殊工艺底层值",
+                "special_process_display": "特殊工艺显示",
+                "material_norm": "材质",
+                "batch_code": "来源生产批号",
+                "po_no": "来源PO",
+            }), hide_index=True)
 
     # =========================
-    # 成品库存充足：直接进入出货管理
+    # 8. 操作按钮
     # =========================
-    if total_finished_qty >= qty_needed:
+    remaining_qty = _safe_float(row.get("remaining_qty"))
+    finished_stock_total = _safe_float(row.get("finished_stock_total"))
+    finished_gap = _safe_float(row.get("finished_gap"))
+
+    if remaining_qty <= 0:
+        st.success("该交付批次已完成出货。")
+
+    elif finished_stock_total >= remaining_qty:
         st.success(
-            f"成品库存充足：需发 {qty_needed:.0f}，成品可用 {total_finished_qty:.0f}。"
+            f"成品库存充足：需发 {remaining_qty:.0f}，"
+            f"成品可用 {finished_stock_total:.0f}。"
             "点击下方按钮后将进入【发货准备】，并同步至【出货管理】。"
         )
 
-        if st.button("成品库存充足，推送至出货管理", key=f"sales_ready_ship_{selected_delivery_plan_id}"):
-            ok, msg = update_delivery_plan_by_sales_decision(
-                conn=conn,
-                delivery_plan_id=int(selected_delivery_plan_id),
-                action_choice="自动判断",
-                note="成品库存充足，销售推送至出货管理"
-            )
+        if st.button(
+            "成品库存充足，推送至出货管理",
+            key=f"sales_push_to_shipment_{int(row['delivery_plan_id'])}"
+        ):
+            try:
+                conn.execute("PRAGMA busy_timeout = 30000")
 
-            if ok:
-                st.success(msg)
-                st.session_state["_jump_to_page"] = "出货管理"
+                conn.execute("""
+                    UPDATE delivery_plan
+                    SET delivery_status = '发货准备'
+                    WHERE delivery_plan_id = ?
+                """, (int(row["delivery_plan_id"]),))
+
+                conn.commit()
+
+                if "sync_after_delivery_plan_change" in globals():
+                    try:
+                        sync_after_delivery_plan_change(
+                            conn,
+                            int(row["delivery_plan_id"])
+                        )
+                    except Exception:
+                        pass
+
+                st.cache_data.clear()
+                st.success("已推送至出货管理。")
                 st.rerun()
-            else:
-                st.error(msg)
 
-    # =========================
-    # 成品库存不足：人工组合选择
-    # =========================
+            except Exception as e:
+                conn.rollback()
+                st.error(f"推送失败：{e}")
+
     else:
         st.warning(
-            f"成品库存不足：需发 {qty_needed:.0f}，成品可用 {total_finished_qty:.0f}，"
-            f"缺口 {shortage_qty:.0f}。请销售端选择后续处理方式。"
+            f"成品库存不足：需发 {remaining_qty:.0f}，"
+            f"当前成品可用 {finished_stock_total:.0f}，"
+            f"缺口 {finished_gap:.0f}。"
         )
 
-        with st.form(f"sales_manual_decision_form_{selected_delivery_plan_id}"):
-
-            st.markdown("### 人工处理选择")
-
-            default_need_semi = semi_finished_qty > 0
-            default_need_production = (
-                semi_finished_qty <= 0
-                or semi_finished_qty < shortage_qty
+        if _safe_float(row.get("semi_finished_qty")) > 0:
+            st.info(
+                "当前有半成品库存，可以考虑进入质检 / 入库流程后再出货。"
             )
 
-            need_production = st.checkbox(
-                "需要安排生产",
-                value=default_need_production,
-                key=f"sales_need_production_{selected_delivery_plan_id}"
-            )
+        if st.button(
+            "标记为需要生产 / 补货",
+            key=f"sales_mark_need_production_{int(row['delivery_plan_id'])}"
+        ):
+            try:
+                conn.execute("""
+                    UPDATE delivery_plan
+                    SET delivery_status = '需要生产'
+                    WHERE delivery_plan_id = ?
+                """, (int(row["delivery_plan_id"]),))
 
-            need_semi_out = st.checkbox(
-                "需要半成品出库",
-                value=default_need_semi,
-                key=f"sales_need_semi_out_{selected_delivery_plan_id}"
-            )
-
-            st.markdown("### 当前可用资源")
-
-            r1, r2, r3, r4 = st.columns(4)
-            r1.metric("剩余待满足", f"{qty_needed:.0f}")
-            r2.metric("成品库存合计", f"{total_finished_qty:.0f}")
-            r3.metric("半成品数量", f"{semi_finished_qty:.0f}")
-            r4.metric("成品缺口", f"{shortage_qty:.0f}")
-
-            if semi_finished_qty > 0 and semi_finished_qty < shortage_qty:
-                st.warning(
-                    f"当前半成品数量 {semi_finished_qty:.0f} 小于成品缺口 {shortage_qty:.0f}。"
-                    "建议同时勾选【需要安排生产】和【需要半成品出库】。"
-                )
-
-            if semi_finished_qty >= shortage_qty and shortage_qty > 0:
-                st.info(
-                    f"当前半成品数量 {semi_finished_qty:.0f} 可以覆盖成品缺口 {shortage_qty:.0f}。"
-                    "可以只选择半成品出库，也可以同时安排生产作为后续补货。"
-                )
-
-            if semi_finished_qty <= 0:
-                st.info("当前没有可用半成品，如成品库存不足，建议选择安排生产。")
-
-            decision_note = st.text_area(
-                "处理说明",
-                placeholder="例如：成品不足，现有半成品先出库，同时安排生产补足剩余缺口。",
-                key=f"sales_decision_note_{selected_delivery_plan_id}"
-            )
-
-            final_check = st.checkbox(
-                "我已确认库存情况和后续处理方式。",
-                key=f"sales_decision_final_check_{selected_delivery_plan_id}"
-            )
-
-            submitted = st.form_submit_button("确认并同步处理消息")
-
-        if submitted:
-            if not final_check:
-                st.error("请先勾选确认。")
-                return
-
-            if not need_production and not need_semi_out:
-                st.error("请至少选择一种处理方式：需要安排生产 或 需要半成品出库。")
-                return
-
-            if need_semi_out and semi_finished_qty <= 0:
-                st.error("当前没有可用半成品，不能选择半成品出库。")
-                return
-
-            if need_semi_out and semi_finished_qty < shortage_qty and not need_production:
-                st.warning(
-                    "半成品数量不足以覆盖全部缺口。"
-                    "如果仍只选择半成品出库，后续可能仍无法满足完整交付。"
-                )
-
-            ok, msg = update_delivery_plan_by_sales_decision(
-                conn=conn,
-                delivery_plan_id=int(selected_delivery_plan_id),
-                note=decision_note,
-                need_production=need_production,
-                need_semi_out=need_semi_out
-            )
-
-            if ok:
-                st.success(msg)
-
-                if need_production and need_semi_out:
-                    st.info("已同时同步到【排产看板】和【半成品仓库看板】。")
-                    st.session_state["_jump_to_page"] = "排产看板"
-
-                elif need_production:
-                    st.session_state["_jump_to_page"] = "排产看板"
-
-                elif need_semi_out:
-                    st.session_state["_jump_to_page"] = "半成品仓库看板"
-
+                conn.commit()
+                st.cache_data.clear()
+                st.success("已标记为需要生产 / 补货。")
                 st.rerun()
-            else:
-                st.error(msg)
 
-    st.markdown("---")
+            except Exception as e:
+                conn.rollback()
+                st.error(f"更新失败：{e}")
 
     # =========================
-    # 5. 当前订单追踪明细
+    # 9. 调试区
     # =========================
-    with st.expander("查看当前订单全流程追踪", expanded=False):
-        render_current_order_trace_detail(
-            conn,
-            int(selected["order_item_id"])
-        )
+    with st.expander("调试：查看销售看板当前数据"):
+         debug_cols = [
+            "delivery_plan_id",
+            "order_item_id",
+            "customer_name",
+            "po_no",
+            "delivery_batch_no",
+            "delivery_status",
+            "planned_delivery_qty",
+            "actual_delivery_qty",
+            "remaining_qty",
+            "wh_order_qty",
+            "wh_spec_qty",
+            "wh_spec_lot_count",
+            "finished_stock_total",
+            "finished_gap",
+            "semi_finished_qty",
+            "need_production",
+            "need_semi_finished_outbound",
+            "sales_action",
+            "product_name",
+            "product_code",
+            "spec_code_norm",
+            "spec_desc",
+            "special_process_display",
+            "material_norm",
+            "planned_delivery_date",
+            "trace_key",
+        ]
 
+         debug_cols = [c for c in debug_cols if c in dashboard_df.columns]
+         debug_df = dashboard_df[debug_cols].copy()
+         debug_df = debug_df.rename(columns={
+            "delivery_plan_id": "交付计划ID",
+            "order_item_id": "订单明细ID",
+            "customer_name": "客户",
+            "po_no": "PO",
+            "delivery_batch_no": "交付批次",
+            "delivery_status": "交付状态",
+            "planned_delivery_qty": "计划交付数量",
+            "actual_delivery_qty": "实际交付数量",
+            "remaining_qty": "剩余待满足",
+            "wh_order_qty": "WH-ORDER订单库存",
+            "wh_spec_qty": "WH-SPEC规格库存",
+            "wh_spec_lot_count": "WH-SPEC Lot数",
+            "finished_stock_total": "成品库存合计",
+            "finished_gap": "成品缺口",
+            "semi_finished_qty": "半成品数量",
+            "need_production": "是否需要生产",
+            "need_semi_finished_outbound": "是否需要半成品出库",
+            "sales_action": "销售处理建议",
+            "product_name": "产品名称",
+            "product_code": "产品编号",
+            "spec_code_norm": "规格编码",
+            "spec_desc": "规格描述",
+            "special_process_display": "特殊工艺显示",
+            "material_norm": "材质标准值",
+            "planned_delivery_date": "计划交付日期",
+            "trace_key": "Trace Key",
+        })
+ 
+        # 双保险：如果仍有重复列名，自动去重
+         debug_df = debug_df.loc[:, ~debug_df.columns.duplicated()]
+         show_df(debug_df, hide_index=True)
 
 
 # =========================
@@ -12418,7 +13005,6 @@ def get_lots_for_delivery_plan_shipment(conn, delivery_plan_id):
 
     return valid_df, plan
 
-
 def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
                                carrier="SF Express",
                                destination="Customer Warehouse",
@@ -12426,19 +13012,19 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
     """
     按交付批次正式出货。
 
-    当前版本：
-    1. 优先扣减订单库存 WH-ORDER
-    2. 如果 WH-ORDER 不足，再扣减同规格 / 工艺 / 材质的 WH-SPEC
+    修正版重点：
+    1. 优先扣订单库存 WH-ORDER。
+    2. WH-ORDER 不足时，再扣同【产品规格 + 特殊工艺 + 材质】的 WH-SPEC。
     3. WH-SPEC 严格按 FIFO 扣减：
-       - 优先按首次入库流水时间 first_in_time
-       - 没有入库流水时间时，按 inventory_lot_id 兜底
-    4. 支持多 Lot 自动拆分扣减
-    5. 写入 shipment、shipment_item、inventory_transaction_log
-    6. 同步 delivery_plan、order_item、orders
+       - 优先按 inventory_transaction_log 中首次入库时间 first_in_time
+       - 没有入库流水时间时，用 inventory_lot_id 从小到大兜底
+    4. 支持一个出货单拆分扣多个 Lot。
+    5. 写入 shipment、shipment_item、inventory_transaction_log。
+    6. 同步 delivery_plan、order_item、orders。
     """
 
     # =========================
-    # 0. 内部安全函数
+    # 0. 安全函数
     # =========================
     def _safe_text(v, default=""):
         try:
@@ -12457,14 +13043,629 @@ def run_delivery_plan_shipment(conn, delivery_plan_id, ship_qty,
         except Exception:
             return default
 
-    def _safe_int(v, default=None):
-        try:
-            if pd.isna(v):
-                return default
-            return int(v)
-        except Exception:
-            return default
+    def _normalize_spec(v):
+        value = _safe_text(v)
+        return value.upper().strip() if value else "UNKNOWN_SPEC"
 
+    def _normalize_process(v):
+        if "normalize_special_process_value" in globals():
+            return normalize_special_process_value(v)
+
+        value = _safe_text(v).upper().strip()
+        if value in ["", "NONE", "NO", "N/A", "NA", "无", "无特殊工艺", "STANDARD", "STANDARD（无特殊工艺）"]:
+            return "STANDARD"
+        return value
+
+    def _normalize_material(v):
+        if "normalize_material_value" in globals():
+            return normalize_material_value(v)
+
+        value = _safe_text(v).upper().strip()
+        return value if value else "UNKNOWN_MATERIAL"
+
+    def _parse_lot_variant(row):
+        """
+        从库存 Lot 解析规格 / 工艺 / 材质。
+        优先 trace_key；失败后使用 product_spec / order_item / production_batch 字段。
+        """
+        parsed_spec = ""
+        parsed_process = ""
+        parsed_material = ""
+
+        trace_key = _safe_text(row.get("trace_key"))
+
+        if "parse_inventory_variant_from_trace_key" in globals():
+            try:
+                parsed = parse_inventory_variant_from_trace_key(trace_key)
+                if isinstance(parsed, dict):
+                    parsed_spec = _safe_text(parsed.get("parsed_spec_code"))
+                    parsed_process = _safe_text(parsed.get("parsed_special_process"))
+                    parsed_material = _safe_text(parsed.get("parsed_material"))
+            except Exception:
+                pass
+
+        spec_code = (
+            parsed_spec
+            or _safe_text(row.get("spec_code"))
+            or _safe_text(row.get("product_spec_text"))
+        )
+
+        special_process = (
+            parsed_process
+            or _safe_text(row.get("raw_special_process"))
+            or _safe_text(row.get("special_process"))
+            or "STANDARD"
+        )
+
+        material = (
+            parsed_material
+            or _safe_text(row.get("raw_material"))
+            or _safe_text(row.get("material"))
+            or "UNKNOWN_MATERIAL"
+        )
+
+        return {
+            "spec_code_norm": _normalize_spec(spec_code),
+            "special_process_norm": _normalize_process(special_process),
+            "material_norm": _normalize_material(material),
+        }
+
+    # =========================
+    # 1. 基础校验
+    # =========================
+    conn.execute("PRAGMA busy_timeout = 30000")
+    cursor = conn.cursor()
+
+    ship_qty = _safe_float(ship_qty)
+
+    if ship_qty <= 0:
+        return False, "出货数量必须大于 0。"
+
+    # =========================
+    # 2. 读取交付批次 / 订单 / 规格信息
+    # =========================
+    plan_df = pd.read_sql_query("""
+        SELECT
+            dp.delivery_plan_id,
+            dp.order_item_id,
+            COALESCE(dp.delivery_batch_no, 1) AS delivery_batch_no,
+            COALESCE(dp.planned_delivery_qty, 0) AS planned_delivery_qty,
+            COALESCE(dp.actual_delivery_qty, 0) AS actual_delivery_qty,
+            COALESCE(dp.delivery_status, '未排产') AS delivery_status,
+
+            oi.order_id,
+            oi.product_id,
+            oi.spec_id,
+            oi.po_no,
+            oi.trace_key AS order_trace_key,
+            oi.product_type_text,
+            oi.product_spec_text,
+            COALESCE(ps.spec_code, oi.product_spec_text) AS spec_code,
+            COALESCE(oi.special_process, 'STANDARD') AS special_process,
+            COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
+            COALESCE(oi.ordered_qty, 0) AS ordered_qty,
+            COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
+
+            o.customer_id,
+            c.customer_name,
+            o.order_status,
+
+            p.product_name,
+            p.product_code,
+            ps.spec_desc
+
+        FROM delivery_plan dp
+        JOIN order_item oi
+            ON dp.order_item_id = oi.order_item_id
+        JOIN orders o
+            ON oi.order_id = o.order_id
+        JOIN customer c
+            ON o.customer_id = c.customer_id
+        LEFT JOIN product p
+            ON oi.product_id = p.product_id
+        LEFT JOIN product_spec ps
+            ON oi.spec_id = ps.spec_id
+
+        WHERE dp.delivery_plan_id = ?
+    """, conn, params=[int(delivery_plan_id)])
+
+    if plan_df.empty:
+        return False, "未找到该交付批次，无法出货。"
+
+    plan = plan_df.iloc[0]
+
+    delivery_plan_id = int(plan["delivery_plan_id"])
+    order_item_id = int(plan["order_item_id"])
+    order_id = int(plan["order_id"])
+    customer_id = int(plan["customer_id"])
+
+    product_id = int(plan["product_id"])
+    spec_id = int(plan["spec_id"])
+
+    planned_qty = _safe_float(plan.get("planned_delivery_qty"))
+    actual_delivery_qty = _safe_float(plan.get("actual_delivery_qty"))
+    remaining_delivery_qty = max(planned_qty - actual_delivery_qty, 0)
+
+    if planned_qty > 0 and ship_qty > remaining_delivery_qty:
+        return False, (
+            f"本次出货数量不能超过该交付批次剩余待出货数量。"
+            f"计划 {planned_qty:.0f}，已出 {actual_delivery_qty:.0f}，"
+            f"剩余 {remaining_delivery_qty:.0f}。"
+        )
+
+    order_trace_key = _safe_text(plan.get("order_trace_key"))
+
+    spec_code_norm = _normalize_spec(plan.get("spec_code"))
+    special_process_norm = _normalize_process(plan.get("special_process"))
+    material_norm = _normalize_material(plan.get("material"))
+
+    if "build_spec_stock_group_key" in globals():
+        spec_stock_key = build_spec_stock_group_key(
+            spec_code_norm,
+            special_process_norm,
+            material_norm
+        )
+    elif "build_spec_stock_trace_key" in globals():
+        spec_stock_key = build_spec_stock_trace_key(
+            product_spec_text=spec_code_norm,
+            special_process=special_process_norm,
+            material=material_norm
+        )
+    else:
+        spec_stock_key = f"SPEC_STOCK__{spec_code_norm}__{special_process_norm}__{material_norm}"
+
+    # =========================
+    # 3. 查询 WH-ORDER 候选库存
+    #    原订单库存优先；同一个订单库存内部也按 FIFO。
+    # =========================
+    order_lot_df = pd.read_sql_query("""
+        WITH inbound_time AS (
+            SELECT
+                inventory_lot_id,
+                MIN(txn_time) AS first_in_time,
+                MAX(txn_time) AS last_in_time
+            FROM inventory_transaction_log
+            WHERE COALESCE(qty, 0) > 0
+            GROUP BY inventory_lot_id
+        )
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.product_id,
+            il.spec_id,
+            il.production_batch_id,
+            il.trace_key,
+            il.location,
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.lot_status, 'available') AS lot_status,
+            COALESCE(il.release_status, 'released') AS release_status,
+            COALESCE(inbound_time.first_in_time, '') AS first_in_time,
+            COALESCE(inbound_time.last_in_time, '') AS last_in_time,
+            1 AS alloc_priority,
+            'WH-ORDER' AS match_type
+        FROM inventory_lot il
+        LEFT JOIN inbound_time
+            ON il.inventory_lot_id = inbound_time.inventory_lot_id
+        WHERE il.location = 'WH-ORDER'
+          AND il.trace_key = ?
+          AND COALESCE(il.available_qty, 0) > 0
+          AND COALESCE(il.release_status, 'released') = 'released'
+          AND COALESCE(il.lot_status, 'available') IN ('available', 'partial')
+        ORDER BY
+            CASE
+                WHEN inbound_time.first_in_time IS NULL THEN 1
+                ELSE 0
+            END ASC,
+            inbound_time.first_in_time ASC,
+            il.inventory_lot_id ASC
+    """, conn, params=[order_trace_key])
+
+    # =========================
+    # 4. 查询 WH-SPEC 候选库存
+    #    重点：先取同 spec_id 的 WH-SPEC，再用 Python 统一口径筛选。
+    #    这样可以兼容旧 trace_key 里 “无 / STANDARD / spda-lime”等历史数据。
+    # =========================
+    spec_lot_raw_df = pd.read_sql_query("""
+        WITH inbound_time AS (
+            SELECT
+                inventory_lot_id,
+                MIN(txn_time) AS first_in_time,
+                MAX(txn_time) AS last_in_time
+            FROM inventory_transaction_log
+            WHERE COALESCE(qty, 0) > 0
+              AND (
+                    txn_type LIKE '%IN%'
+                 OR txn_type LIKE '%RETURN%'
+                 OR txn_type LIKE '%SPEC%'
+                 OR txn_type LIKE '%ADJUST%'
+              )
+            GROUP BY inventory_lot_id
+        )
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.product_id,
+            il.spec_id,
+            il.production_batch_id,
+            il.trace_key,
+            il.location,
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.lot_status, 'available') AS lot_status,
+            COALESCE(il.release_status, 'released') AS release_status,
+            COALESCE(inbound_time.first_in_time, '') AS first_in_time,
+            COALESCE(inbound_time.last_in_time, '') AS last_in_time,
+
+            ps.spec_code,
+            ps.spec_desc,
+
+            pb.batch_code,
+            COALESCE(pb.special_process, oi.special_process, 'STANDARD') AS raw_special_process,
+            COALESCE(pb.material, oi.material, 'UNKNOWN_MATERIAL') AS raw_material,
+
+            oi.po_no,
+            oi.product_spec_text,
+            oi.special_process,
+            oi.material,
+
+            2 AS alloc_priority,
+            'WH-SPEC-FIFO' AS match_type
+
+        FROM inventory_lot il
+        LEFT JOIN inbound_time
+            ON il.inventory_lot_id = inbound_time.inventory_lot_id
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+
+        WHERE il.location = 'WH-SPEC'
+          AND il.spec_id = ?
+          AND COALESCE(il.available_qty, 0) > 0
+          AND COALESCE(il.release_status, 'released') = 'released'
+          AND COALESCE(il.lot_status, 'available') IN ('available', 'partial')
+
+        ORDER BY
+            CASE
+                WHEN inbound_time.first_in_time IS NULL THEN 1
+                ELSE 0
+            END ASC,
+            inbound_time.first_in_time ASC,
+            il.inventory_lot_id ASC
+    """, conn, params=[spec_id])
+
+    if not spec_lot_raw_df.empty:
+        spec_lot_df = spec_lot_raw_df.copy()
+
+        parsed_records = spec_lot_df.apply(_parse_lot_variant, axis=1)
+
+        spec_lot_df["spec_code_norm"] = parsed_records.apply(lambda x: x["spec_code_norm"])
+        spec_lot_df["special_process_norm"] = parsed_records.apply(lambda x: x["special_process_norm"])
+        spec_lot_df["material_norm"] = parsed_records.apply(lambda x: x["material_norm"])
+
+        spec_lot_df = spec_lot_df[
+            (spec_lot_df["spec_code_norm"] == spec_code_norm)
+            &
+            (spec_lot_df["special_process_norm"] == special_process_norm)
+            &
+            (spec_lot_df["material_norm"] == material_norm)
+        ].copy()
+
+        if not spec_lot_df.empty:
+            spec_lot_df["first_in_time_sort"] = pd.to_datetime(
+                spec_lot_df["first_in_time"],
+                errors="coerce"
+            )
+
+            spec_lot_df = spec_lot_df.sort_values(
+                by=["first_in_time_sort", "inventory_lot_id"],
+                ascending=[True, True],
+                na_position="last"
+            ).drop(columns=["first_in_time_sort"])
+    else:
+        spec_lot_df = pd.DataFrame()
+
+    # =========================
+    # 5. 合并扣减队列
+    #    WH-ORDER 永远优先；
+    #    WH-SPEC 内部严格 FIFO。
+    # =========================
+    candidate_frames = []
+
+    if not order_lot_df.empty:
+        candidate_frames.append(order_lot_df)
+
+    if not spec_lot_df.empty:
+        candidate_frames.append(spec_lot_df)
+
+    if not candidate_frames:
+        return False, (
+            "没有可用于出货的库存。系统已检查："
+            "原订单库存 WH-ORDER，以及同规格 / 工艺 / 材质的 WH-SPEC FIFO 库存。"
+        )
+
+    lot_df = pd.concat(candidate_frames, ignore_index=True)
+
+    lot_df["available_qty"] = pd.to_numeric(
+        lot_df["available_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    lot_df["first_in_time_sort"] = pd.to_datetime(
+        lot_df["first_in_time"],
+        errors="coerce"
+    )
+
+    lot_df = lot_df.sort_values(
+        by=["alloc_priority", "first_in_time_sort", "inventory_lot_id"],
+        ascending=[True, True, True],
+        na_position="last"
+    ).reset_index(drop=True)
+
+    total_available = float(lot_df["available_qty"].sum())
+
+    if total_available < ship_qty:
+        return False, (
+            f"库存不足，无法出货。需要 {ship_qty:.0f}，"
+            f"当前可用 {total_available:.0f}。"
+        )
+
+    # =========================
+    # 6. 创建出货单
+    # =========================
+    shipment_no = (
+        "SHP-"
+        + datetime.now().strftime("%Y%m%d%H%M%S")
+        + f"-DP{delivery_plan_id}"
+    )
+
+    ship_date = date.today().isoformat()
+
+    try:
+        cursor.execute("""
+            INSERT INTO shipment (
+                shipment_no,
+                customer_id,
+                ship_date,
+                carrier,
+                destination,
+                created_by,
+                shipment_status,
+                notes
+            ) VALUES (?, ?, ?, ?, ?, ?, 'created', ?)
+        """, (
+            shipment_no,
+            customer_id,
+            ship_date,
+            _safe_text(carrier, "SF Express"),
+            _safe_text(destination, "Customer Warehouse"),
+            _safe_text(created_by, "Shipment User"),
+            (
+                f"Auto shipment for delivery_plan_id={delivery_plan_id}; "
+                f"WH-SPEC FIFO enabled; "
+                f"spec_pool={spec_stock_key}"
+            )
+        ))
+
+        shipment_id = cursor.lastrowid
+
+        # =========================
+        # 7. 按优先级 + FIFO 扣库存
+        # =========================
+        qty_to_allocate = float(ship_qty)
+        allocated_rows = []
+
+        for _, lot in lot_df.iterrows():
+            if qty_to_allocate <= 0:
+                break
+
+            lot_id = int(lot["inventory_lot_id"])
+            lot_code = _safe_text(lot.get("lot_code"))
+            location = _safe_text(lot.get("location"))
+            match_type = _safe_text(lot.get("match_type"))
+            available_qty = _safe_float(lot.get("available_qty"))
+            first_in_time = _safe_text(lot.get("first_in_time"))
+
+            if available_qty <= 0:
+                continue
+
+            take_qty = min(available_qty, qty_to_allocate)
+
+            if take_qty <= 0:
+                continue
+
+            packaging_code = f"PKG-{shipment_no}-LOT{lot_id}"
+
+            # 7.1 写出货明细
+            cursor.execute("""
+                INSERT INTO shipment_item (
+                    shipment_id,
+                    order_item_id,
+                    inventory_lot_id,
+                    shipped_qty,
+                    packaging_label_code,
+                    trace_key
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                int(shipment_id),
+                int(order_item_id),
+                int(lot_id),
+                float(take_qty),
+                packaging_code,
+                order_trace_key
+            ))
+
+            # 7.2 扣库存
+            cursor.execute("""
+                UPDATE inventory_lot
+                SET available_qty = COALESCE(available_qty, 0) - ?,
+                    lot_status = CASE
+                        WHEN COALESCE(available_qty, 0) - ? <= 0 THEN 'depleted'
+                        ELSE 'partial'
+                    END,
+                    last_out_qty = ?,
+                    last_out_time = datetime('now')
+                WHERE inventory_lot_id = ?
+            """, (
+                float(take_qty),
+                float(take_qty),
+                float(take_qty),
+                int(lot_id)
+            ))
+
+            # 7.3 写库存流水
+            txn_type = "WH_SPEC_FIFO_OUT" if location == "WH-SPEC" else "WH_ORDER_OUT"
+
+            cursor.execute("""
+                INSERT INTO inventory_transaction_log (
+                    inventory_lot_id,
+                    txn_type,
+                    qty,
+                    txn_time,
+                    txn_reason,
+                    reference_no
+                ) VALUES (?, ?, ?, datetime('now'), ?, ?)
+            """, (
+                int(lot_id),
+                txn_type,
+                -float(take_qty),
+                (
+                    f"shipment_delivery_plan_{delivery_plan_id}; "
+                    f"{match_type}; "
+                    f"FIFO first_in_time={first_in_time or 'NO_INBOUND_TIME'}; "
+                    f"spec={spec_code_norm}; "
+                    f"process={special_process_norm}; "
+                    f"material={material_norm}"
+                ),
+                shipment_no
+            ))
+
+            allocated_rows.append({
+                "lot_id": lot_id,
+                "lot_code": lot_code,
+                "location": location,
+                "match_type": match_type,
+                "first_in_time": first_in_time,
+                "before_available_qty": available_qty,
+                "deduct_qty": take_qty,
+                "after_available_qty": available_qty - take_qty,
+            })
+
+            qty_to_allocate -= take_qty
+
+        if qty_to_allocate > 0:
+            conn.rollback()
+            return False, f"库存分配异常，仍有 {qty_to_allocate:.0f} 未完成扣减。"
+
+        # =========================
+        # 8. 更新 delivery_plan
+        # =========================
+        new_actual_delivery_qty = actual_delivery_qty + ship_qty
+
+        if planned_qty > 0 and new_actual_delivery_qty >= planned_qty:
+            new_delivery_status = "已出货"
+        elif new_actual_delivery_qty > 0:
+            new_delivery_status = "部分出货"
+        else:
+            new_delivery_status = _safe_text(plan.get("delivery_status"), "未排产")
+
+        cursor.execute("""
+            UPDATE delivery_plan
+            SET actual_delivery_qty = COALESCE(actual_delivery_qty, 0) + ?,
+                actual_delivery_date = ?,
+                delivery_status = ?
+            WHERE delivery_plan_id = ?
+        """, (
+            float(ship_qty),
+            ship_date,
+            new_delivery_status,
+            int(delivery_plan_id)
+        ))
+
+        # =========================
+        # 9. 更新 order_item
+        # =========================
+        cursor.execute("""
+            UPDATE order_item
+            SET shipped_qty = COALESCE(shipped_qty, 0) + ?
+            WHERE order_item_id = ?
+        """, (
+            float(ship_qty),
+            int(order_item_id)
+        ))
+
+        # =========================
+        # 10. 更新订单状态
+        # =========================
+        cursor.execute("""
+            UPDATE orders
+            SET order_status = CASE
+                WHEN (
+                    SELECT COALESCE(SUM(shipped_qty), 0)
+                    FROM order_item
+                    WHERE order_id = ?
+                ) >= (
+                    SELECT COALESCE(SUM(ordered_qty), 0)
+                    FROM order_item
+                    WHERE order_id = ?
+                )
+                THEN 'completed'
+                ELSE order_status
+            END
+            WHERE order_id = ?
+        """, (
+            int(order_id),
+            int(order_id),
+            int(order_id)
+        ))
+
+        conn.commit()
+
+        # =========================
+        # 11. 出货后同步联动状态
+        # =========================
+        if "sync_after_delivery_plan_change" in globals():
+            try:
+                sync_after_delivery_plan_change(conn, int(delivery_plan_id))
+            except Exception:
+                pass
+
+        # =========================
+        # 12. 返回结果
+        # =========================
+        allocated_summary = "；".join([
+            (
+                f"{x['lot_code']} "
+                f"({x['location']} / {x['match_type']} / "
+                f"首次入库 {x['first_in_time'] or '无入库时间记录'}) "
+                f"扣减 {x['deduct_qty']:.0f}"
+            )
+            for x in allocated_rows
+        ])
+
+        return True, (
+            f"出货完成。出货单：{shipment_no}。"
+            f"本次出货 {ship_qty:.0f}。"
+            f"交付批次累计出货 {new_actual_delivery_qty:.0f} / {planned_qty:.0f}。"
+            f"库存扣减顺序：{allocated_summary}"
+        )
+
+    except sqlite3.OperationalError as e:
+        conn.rollback()
+
+        if "database is locked" in str(e).lower():
+            return False, "数据库当前被锁定，请关闭其他运行中的 Streamlit 进程后重试。"
+
+        return False, f"出货失败：{e}"
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"出货失败：{e}"
 
 # =========================
 # 主数据拼写修复规则
@@ -18788,6 +19989,179 @@ def prepare_spec_stock_views(spec_base_df):
     )
 
     return df, spec_group_df, spec_summary_df
+
+def get_available_wh_spec_qty_by_variant(conn, spec_id, spec_code, special_process, material):
+    """
+    统一计算 WH-SPEC 规格化库存可用数量。
+
+    用途：
+    - 销售看板
+    - 出货前库存判断
+    - 规格化库存页面
+    - 后续所有需要判断 WH-SPEC 是否满足订单的地方
+
+    统一口径：
+    1. WH-SPEC
+    2. 同 spec_id
+    3. 解析 trace_key
+    4. 标准化 产品规格 + 特殊工艺 + 材质
+    5. 汇总 available_qty
+
+    这样可以兼容旧数据：
+    - STANDARD / 无 / 无特殊工艺
+    - SPDA-LIME / SODA-LIME
+    - SPEC_STOCK Trace Key
+    - 订单 Trace Key 转入的 WH-SPEC
+    """
+
+    def _safe_text(v, default=""):
+        try:
+            value = normalize_text(v)
+        except Exception:
+            value = "" if v is None else str(v).strip()
+
+        value = "" if value is None else str(value).strip()
+        return value if value else default
+
+    def _normalize_spec(v):
+        value = _safe_text(v)
+        return value.upper().strip() if value else "UNKNOWN_SPEC"
+
+    def _normalize_process(v):
+        if "normalize_special_process_value" in globals():
+            return normalize_special_process_value(v)
+
+        value = _safe_text(v).upper().strip()
+        if value in ["", "NONE", "NO", "N/A", "NA", "无", "无特殊工艺", "STANDARD", "STANDARD（无特殊工艺）"]:
+            return "STANDARD"
+        return value
+
+    def _normalize_material(v):
+        if "normalize_material_value" in globals():
+            return normalize_material_value(v)
+
+        value = _safe_text(v).upper().strip()
+        return value if value else "UNKNOWN_MATERIAL"
+
+    target_spec = _normalize_spec(spec_code)
+    target_process = _normalize_process(special_process)
+    target_material = _normalize_material(material)
+
+    raw_df = pd.read_sql_query("""
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.trace_key,
+            il.location,
+            il.spec_id,
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.lot_status, 'available') AS lot_status,
+            COALESCE(il.release_status, 'released') AS release_status,
+
+            ps.spec_code,
+            ps.spec_desc,
+
+            pb.batch_code,
+            COALESCE(pb.special_process, oi.special_process, 'STANDARD') AS raw_special_process,
+            COALESCE(pb.material, oi.material, 'UNKNOWN_MATERIAL') AS raw_material,
+
+            oi.product_spec_text,
+            oi.special_process,
+            oi.material,
+            oi.po_no
+
+        FROM inventory_lot il
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+
+        WHERE il.location = 'WH-SPEC'
+          AND il.spec_id = ?
+          AND COALESCE(il.available_qty, 0) > 0
+          AND COALESCE(il.release_status, 'released') = 'released'
+          AND COALESCE(il.lot_status, 'available') IN ('available', 'partial')
+    """, conn, params=[int(spec_id)])
+
+    if raw_df.empty:
+        return 0.0, raw_df
+
+    df = raw_df.copy()
+
+    parsed_spec_list = []
+    parsed_process_list = []
+    parsed_material_list = []
+
+    for _, row in df.iterrows():
+        parsed_spec = ""
+        parsed_process = ""
+        parsed_material = ""
+
+        trace_key = _safe_text(row.get("trace_key"))
+
+        if "parse_inventory_variant_from_trace_key" in globals():
+            try:
+                parsed = parse_inventory_variant_from_trace_key(trace_key)
+
+                if isinstance(parsed, dict):
+                    parsed_spec = _safe_text(parsed.get("parsed_spec_code"))
+                    parsed_process = _safe_text(parsed.get("parsed_special_process"))
+                    parsed_material = _safe_text(parsed.get("parsed_material"))
+            except Exception:
+                pass
+
+        final_spec = (
+            parsed_spec
+            or _safe_text(row.get("spec_code"))
+            or _safe_text(row.get("product_spec_text"))
+        )
+
+        final_process = (
+            parsed_process
+            or _safe_text(row.get("raw_special_process"))
+            or _safe_text(row.get("special_process"))
+            or "STANDARD"
+        )
+
+        final_material = (
+            parsed_material
+            or _safe_text(row.get("raw_material"))
+            or _safe_text(row.get("material"))
+            or "UNKNOWN_MATERIAL"
+        )
+
+        parsed_spec_list.append(_normalize_spec(final_spec))
+        parsed_process_list.append(_normalize_process(final_process))
+        parsed_material_list.append(_normalize_material(final_material))
+
+    df["spec_code_norm"] = parsed_spec_list
+    df["special_process_norm"] = parsed_process_list
+    df["material_norm"] = parsed_material_list
+
+    matched_df = df[
+        (df["spec_code_norm"] == target_spec)
+        &
+        (df["special_process_norm"] == target_process)
+        &
+        (df["material_norm"] == target_material)
+    ].copy()
+
+    if matched_df.empty:
+        return 0.0, matched_df
+
+    available_qty = float(
+        pd.to_numeric(
+            matched_df["available_qty"],
+            errors="coerce"
+        ).fillna(0).sum()
+    )
+
+    return available_qty, matched_df
 
 def render_spec_stock_query_section(conn, section_key_prefix="spec_stock"):
     """
