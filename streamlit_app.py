@@ -621,6 +621,84 @@ def normalize_text(v):
         return ""
     return str(v).strip()
 
+# =========================
+# 特殊工艺 STANDARD / 无 统一口径
+# =========================
+
+STANDARD_PROCESS_VALUE = "STANDARD"
+STANDARD_PROCESS_LABEL = "STANDARD（无特殊工艺）"
+
+NO_SPECIAL_PROCESS_VALUES = [
+    "",
+    "STANDARD",
+    "STANDARD（无特殊工艺）",
+    "STANDARD(无特殊工艺)",
+    "NONE",
+    "NO",
+    "N/A",
+    "NA",
+    "无",
+    "无特殊工艺",
+]
+
+
+def normalize_special_process_value(v):
+    """
+    特殊工艺底层值统一函数。
+
+    统一规则：
+    无 / 无特殊工艺 / NONE / NO / N/A / NA / STANDARD / 空值
+    全部归一为 STANDARD。
+
+    数据库存储、Trace Key、路线判断都应该使用这个函数。
+    """
+    try:
+        text = normalize_text(v)
+    except Exception:
+        text = "" if v is None else str(v).strip()
+
+    text_upper = str(text).strip().upper()
+
+    no_values_upper = [str(x).strip().upper() for x in NO_SPECIAL_PROCESS_VALUES]
+
+    if text_upper in no_values_upper:
+        return STANDARD_PROCESS_VALUE
+
+    return text_upper
+
+
+def display_special_process_label(v):
+    """
+    特殊工艺页面显示函数。
+
+    底层 STANDARD 页面显示为 STANDARD（无特殊工艺）。
+    其他特殊工艺直接显示原值。
+    """
+    value = normalize_special_process_value(v)
+
+    if value == STANDARD_PROCESS_VALUE:
+        return STANDARD_PROCESS_LABEL
+
+    return value
+
+
+def normalize_material_value(v, default="UNKNOWN_MATERIAL"):
+    """
+    材质统一函数。
+    """
+    try:
+        text = normalize_text(v)
+    except Exception:
+        text = "" if v is None else str(v).strip()
+
+    text = str(text).strip()
+
+    if not text:
+        return default
+
+    return text.upper()
+
+
 def normalize_trace_part(v, default="NA"):
     """
     Trace Key 组件标准化：
@@ -640,19 +718,24 @@ def normalize_trace_part(v, default="NA"):
 
     return text
 
-
 def build_trace_key(po_no, spec_code, special_process, material):
     """
     四重限制 Trace Key：
     PO + 规格 + 特殊工艺 + 材质
+
+    注意：
+    特殊工艺统一口径：
+    无 / 无特殊工艺 / NONE / STANDARD → STANDARD
     """
+    special_process_clean = normalize_special_process_value(special_process)
+    material_clean = normalize_material_value(material)
+
     return "__".join([
         normalize_trace_part(po_no, "NOPO"),
         normalize_trace_part(spec_code, "NOSPEC"),
-        normalize_trace_part(special_process, "STANDARD"),
-        normalize_trace_part(material, "UNKNOWN_MATERIAL"),
+        normalize_trace_part(special_process_clean, "STANDARD"),
+        normalize_trace_part(material_clean, "UNKNOWN_MATERIAL"),
     ])
-
 
 def parse_inventory_variant_from_trace_key(trace_key):
     """
@@ -737,15 +820,14 @@ PROCESS_CN_GLOBAL = {
     "End Inspection": "端检",
 }
 
-
 def has_special_process(special_process):
     """
     判断是否有特殊工艺。
-    STANDARD / 空值 / NONE 等都视为无特殊工艺。
-    """
-    sp = normalize_text(special_process).upper()
-    return sp not in NO_SPECIAL_PROCESS_VALUES
 
+    STANDARD / 无 / NONE / 空值 都视为无特殊工艺。
+    """
+    sp = normalize_special_process_value(special_process)
+    return sp != STANDARD_PROCESS_VALUE
 
 def get_production_route(special_process):
     """
@@ -5231,7 +5313,8 @@ def page_order_entry(conn):
             "特殊工艺",
             special_process_options,
             index=0,
-            key="order_entry_special_process"
+            key="order_entry_special_process",
+            format_func=display_special_process_label
         )
 
     with p3:
@@ -18231,238 +18314,101 @@ def prepare_spec_stock_views(spec_base_df):
 
 def render_spec_stock_query_section(conn, section_key_prefix="spec_stock"):
     """
-    规格化库存查询区块。
+    规格化库存 WH-SPEC 查询区
 
-    查询口径：
-    1. 产品规格优先
-    2. 特殊工艺
-    3. 材质
-    4. Lot 明细
-
-    本版修正：
-    - WH-SPEC 优先从 trace_key 解析规格 / 工艺 / 材质
-    - 避免退货再上架库存显示 UNKNOWN_MATERIAL
+    优化版逻辑：
+    1. 顶部使用三级联动筛选：
+       产品规格 → 特殊工艺 → 材质
+    2. 保留合并逻辑：
+       无 / 无特殊工艺 / NONE / STANDARD 都归一为 STANDARD
+    3. 页面显示：
+       STANDARD 显示为 STANDARD（无特殊工艺）
+    4. 下方根据筛选层级自动展示：
+       - 未选择规格：展示所有规格总览
+       - 选择规格：展示该规格下的工艺 / 材质分布
+       - 选择规格 + 工艺：展示该规格 + 工艺下的材质分布
+       - 选择规格 + 工艺 + 材质：展示精确库存池 + Lot 明细
     """
 
-    st.subheader("规格化库存 WH-SPEC｜按规格 + 特殊工艺 + 材质查询")
+    st.subheader("规格化库存 WH-SPEC｜规格 / 工艺 / 材质联动查询")
 
     st.info(
-        "规格化库存查询口径：优先按【产品规格】整体检索，"
-        "再用【特殊工艺 + 材质】精确定位库存池。"
-        "WH-SPEC 会优先从 Trace Key 解析规格、特殊工艺和材质，"
-        "适用于超产入库、退货再上架、非买卖调整和可售规格库存查询。"
-    )
-
-    spec_base_df = get_spec_stock_base_df(conn)
-    spec_detail_df, spec_group_df, spec_summary_df = prepare_spec_stock_views(spec_base_df)
-
-    if spec_base_df.empty:
-        st.info("当前没有规格化库存。")
-        return
-
-    # =========================
-    # 1. 顶部指标
-    # =========================
-    total_spec_qty = float(
-        pd.to_numeric(spec_detail_df["lot_total_qty"], errors="coerce").fillna(0).sum()
-    )
-    total_available_qty = float(
-        pd.to_numeric(spec_detail_df["available_qty"], errors="coerce").fillna(0).sum()
-    )
-    total_reserved_qty = float(
-        pd.to_numeric(spec_detail_df["reserved_qty"], errors="coerce").fillna(0).sum()
-    )
-    variant_count = int(spec_group_df["spec_stock_group_key"].nunique())
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("规格化库存总量", f"{total_spec_qty:.0f}")
-    m2.metric("可用数量", f"{total_available_qty:.0f}")
-    m3.metric("预留数量", f"{total_reserved_qty:.0f}")
-    m4.metric("规格变体数", variant_count)
-
-    st.markdown("---")
-
-    # =========================
-    # 2. 筛选区
-    # =========================
-    f1, f2, f3 = st.columns(3)
-
-    spec_options = ["全部"] + sorted(
-        spec_detail_df["display_spec_code"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    with f1:
-        selected_spec = st.selectbox(
-            "产品规格优先检索",
-            spec_options,
-            key=f"{section_key_prefix}_spec_filter"
-        )
-
-    filtered_df = spec_detail_df.copy()
-
-    if selected_spec != "全部":
-        filtered_df = filtered_df[
-            filtered_df["display_spec_code"].astype(str) == selected_spec
-        ].copy()
-
-    process_options = ["全部"] + sorted(
-        filtered_df["display_special_process"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    material_options = ["全部"] + sorted(
-        filtered_df["display_material"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
-    with f2:
-        selected_process = st.selectbox(
-            "特殊工艺",
-            process_options,
-            key=f"{section_key_prefix}_process_filter"
-        )
-
-    with f3:
-        selected_material = st.selectbox(
-            "材质",
-            material_options,
-            key=f"{section_key_prefix}_material_filter"
-        )
-
-    if selected_process != "全部":
-        filtered_df = filtered_df[
-            filtered_df["display_special_process"].astype(str) == selected_process
-        ].copy()
-
-    if selected_material != "全部":
-        filtered_df = filtered_df[
-            filtered_df["display_material"].astype(str) == selected_material
-        ].copy()
-
-    # =========================
-    # 3. 当前筛选指标
-    # =========================
-    if filtered_df.empty:
-        st.warning("当前筛选条件下没有规格化库存。")
-        return
-
-    filtered_total_qty = float(
-        pd.to_numeric(filtered_df["lot_total_qty"], errors="coerce").fillna(0).sum()
-    )
-    filtered_available_qty = float(
-        pd.to_numeric(filtered_df["available_qty"], errors="coerce").fillna(0).sum()
-    )
-    filtered_reserved_qty = float(
-        pd.to_numeric(filtered_df["reserved_qty"], errors="coerce").fillna(0).sum()
-    )
-    filtered_pool_count = int(filtered_df["spec_stock_group_key"].nunique())
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("当前筛选库存", f"{filtered_total_qty:.0f}")
-    c2.metric("当前筛选可用", f"{filtered_available_qty:.0f}")
-    c3.metric("当前筛选预留", f"{filtered_reserved_qty:.0f}")
-    c4.metric("当前筛选库存池", filtered_pool_count)
-
-    # =========================
-    # 4. 重新生成当前筛选后的汇总
-    # =========================
-    current_spec_summary = (
-        filtered_df.groupby([
-            "display_spec_code",
-            "spec_desc",
-            "product_name",
-            "product_code"
-        ], dropna=False)
-        .agg(
-            variant_count=("variant_label", "nunique"),
-            lot_count=("inventory_lot_id", "nunique"),
-            available_qty=("available_qty", "sum"),
-            reserved_qty=("reserved_qty", "sum"),
-            total_qty=("lot_total_qty", "sum")
-        )
-        .reset_index()
-        .sort_values(["display_spec_code"])
-    )
-
-    current_variant_summary = (
-        filtered_df.groupby([
-            "display_spec_code",
-            "display_special_process",
-            "display_material",
-            "variant_label",
-            "spec_stock_group_key"
-        ], dropna=False)
-        .agg(
-            lot_count=("inventory_lot_id", "nunique"),
-            available_qty=("available_qty", "sum"),
-            reserved_qty=("reserved_qty", "sum"),
-            total_qty=("lot_total_qty", "sum")
-        )
-        .reset_index()
-        .sort_values([
-            "display_spec_code",
-            "display_special_process",
-            "display_material"
-        ])
+        "操作逻辑：先选【产品规格】，系统会自动联动展示该规格下的特殊工艺和材质库存。"
+        "系统会将【无特殊工艺 / STANDARD】统一显示为 STANDARD（无特殊工艺）。"
     )
 
     # =========================
-    # 5. 展示 Tabs
+    # 0. 安全函数
     # =========================
-    tab_spec, tab_variant, tab_lot = st.tabs([
-        "按产品规格汇总",
-        "按工艺 / 材质汇总",
-        "Lot 明细"
-    ])
+    def _safe_text(v, default=""):
+        try:
+            value = normalize_text(v)
+        except Exception:
+            value = "" if v is None else str(v).strip()
 
-    with tab_spec:
-        st.subheader("按产品规格汇总")
+        value = "" if value is None else str(value).strip()
+        return value if value else default
 
-        if current_spec_summary.empty:
-            st.info("当前没有规格汇总数据。")
-        else:
-            show_df(current_spec_summary.rename(columns={
-                "display_spec_code": "产品规格",
-                "spec_desc": "规格描述",
-                "product_name": "产品名称",
-                "product_code": "产品编号",
-                "variant_count": "工艺/材质变体数",
-                "lot_count": "Lot数",
-                "available_qty": "可用数量",
-                "reserved_qty": "预留数量",
-                "total_qty": "总数量",
-            }), hide_index=True)
+    def _normalize_spec(v):
+        value = _safe_text(v)
+        if not value:
+            return "UNKNOWN_SPEC"
+        return value.upper().strip()
 
-    with tab_variant:
-        st.subheader("按特殊工艺 / 材质汇总")
+    def _normalize_process(v):
+        """
+        工艺标准化：
+        无 / NONE / STANDARD 都归一为 STANDARD
+        """
+        value = _safe_text(v)
+        if not value:
+            return "STANDARD"
 
-        if current_variant_summary.empty:
-            st.info("当前没有工艺 / 材质汇总数据。")
-        else:
-            show_df(current_variant_summary.rename(columns={
-                "display_spec_code": "产品规格",
-                "display_special_process": "特殊工艺",
-                "display_material": "材质",
-                "variant_label": "工艺 / 材质",
-                "spec_stock_group_key": "规格化库存Key",
-                "lot_count": "Lot数",
-                "available_qty": "可用数量",
-                "reserved_qty": "预留数量",
-                "total_qty": "总数量",
-            }), hide_index=True)
+        value_upper = value.upper().strip()
 
-    with tab_lot:
-        st.subheader("规格化库存 Lot 明细")
+        no_values = [
+            "",
+            "NONE",
+            "NO",
+            "N/A",
+            "NA",
+            "STANDARD",
+            "无",
+            "无特殊工艺",
+            "STANDARD（无特殊工艺）",
+            "STANDARD(无特殊工艺)",
+        ]
+
+        if value_upper in [x.upper() for x in no_values]:
+            return "STANDARD"
+
+        return value_upper
+
+    def _process_display_label(v):
+        """
+        页面显示文案：
+        STANDARD → STANDARD（无特殊工艺）
+        """
+        value = _normalize_process(v)
+
+        if value == "STANDARD":
+            return "STANDARD（无特殊工艺）"
+
+        return value
+
+    def _normalize_material(v):
+        value = _safe_text(v)
+        if not value:
+            return "UNKNOWN_MATERIAL"
+        return value.upper().strip()
+
+    def _show_spec_lot_detail(df):
+        """
+        展示规格化库存 Lot 明细。
+        """
+        if df.empty:
+            st.info("当前没有 Lot 明细。")
+            return
 
         lot_cols = [
             "inventory_lot_id",
@@ -18484,17 +18430,16 @@ def render_spec_stock_query_section(conn, section_key_prefix="spec_stock"):
             "po_no",
             "customer_name",
             "trace_key",
-            "spec_stock_group_key",
             "last_out_qty",
             "last_out_time",
         ]
 
         existing_lot_cols = [
             c for c in lot_cols
-            if c in filtered_df.columns
+            if c in df.columns
         ]
 
-        show_df(filtered_df[existing_lot_cols].rename(columns={
+        show_df(df[existing_lot_cols].rename(columns={
             "inventory_lot_id": "Lot编号",
             "lot_code": "Lot号",
             "product_name": "产品名称",
@@ -18513,11 +18458,581 @@ def render_spec_stock_query_section(conn, section_key_prefix="spec_stock"):
             "batch_code": "来源生产批号",
             "po_no": "来源PO",
             "customer_name": "来源客户",
-            "trace_key": "Trace Key",
-            "spec_stock_group_key": "规格化库存Key",
+            "trace_key": "规格化库存Key",
             "last_out_qty": "最近出库数量",
             "last_out_time": "最近出库时间",
         }), hide_index=True)
+
+    # =========================
+    # 1. 查询 WH-SPEC 明细
+    # =========================
+    spec_stock_df = pd.read_sql_query("""
+        SELECT
+            il.inventory_lot_id,
+            il.lot_code,
+            il.product_id,
+            il.spec_id,
+            il.production_batch_id,
+            il.trace_key,
+            il.location,
+
+            COALESCE(il.available_qty, 0) AS available_qty,
+            COALESCE(il.reserved_qty, 0) AS reserved_qty,
+            COALESCE(il.available_qty, 0) + COALESCE(il.reserved_qty, 0) AS lot_total_qty,
+
+            COALESCE(il.lot_status, 'available') AS lot_status,
+            COALESCE(il.release_status, 'released') AS release_status,
+            COALESCE(il.exclusive_customer, '') AS exclusive_customer,
+            COALESCE(il.forbidden_customer, '') AS forbidden_customer,
+            il.last_out_qty,
+            il.last_out_time,
+
+            p.product_code,
+            p.product_name,
+
+            ps.spec_code,
+            ps.spec_desc,
+
+            pb.batch_code,
+            pb.trace_key AS batch_trace_key,
+
+            oi.po_no,
+            oi.product_type_text,
+            oi.product_spec_text,
+            oi.special_process AS order_special_process,
+            oi.material AS order_material,
+            c.customer_name,
+
+            COALESCE(oi.special_process, pb.special_process, 'STANDARD') AS raw_special_process,
+            COALESCE(oi.material, pb.material, 'UNKNOWN_MATERIAL') AS raw_material
+
+        FROM inventory_lot il
+        LEFT JOIN product p
+            ON il.product_id = p.product_id
+        LEFT JOIN product_spec ps
+            ON il.spec_id = ps.spec_id
+        LEFT JOIN production_batch pb
+            ON il.production_batch_id = pb.production_batch_id
+        LEFT JOIN production_schedule sch
+            ON pb.production_batch_id = sch.production_batch_id
+        LEFT JOIN order_item oi
+            ON sch.order_item_id = oi.order_item_id
+        LEFT JOIN orders o
+            ON oi.order_id = o.order_id
+        LEFT JOIN customer c
+            ON o.customer_id = c.customer_id
+
+        WHERE
+            (
+                il.location = 'WH-SPEC'
+                OR il.trace_key LIKE 'SPEC_STOCK%'
+            )
+          AND COALESCE(il.lot_status, 'available') IN ('available', 'partial', 'hold', 'depleted')
+        ORDER BY
+            ps.spec_code,
+            il.inventory_lot_id DESC
+    """, conn)
+
+    if spec_stock_df.empty:
+        st.info("当前没有规格化库存 WH-SPEC。")
+        return
+
+    spec_stock_df = spec_stock_df.copy()
+
+    # =========================
+    # 2. 从 Trace Key 解析规格 / 工艺 / 材质
+    # =========================
+    if "parse_inventory_variant_from_trace_key" in globals():
+        try:
+            parsed_rows = spec_stock_df["trace_key"].apply(parse_inventory_variant_from_trace_key)
+
+            spec_stock_df["parsed_spec_code"] = parsed_rows.apply(
+                lambda x: x.get("parsed_spec_code", "") if isinstance(x, dict) else ""
+            )
+            spec_stock_df["parsed_special_process"] = parsed_rows.apply(
+                lambda x: x.get("parsed_special_process", "") if isinstance(x, dict) else ""
+            )
+            spec_stock_df["parsed_material"] = parsed_rows.apply(
+                lambda x: x.get("parsed_material", "") if isinstance(x, dict) else ""
+            )
+        except Exception:
+            spec_stock_df["parsed_spec_code"] = ""
+            spec_stock_df["parsed_special_process"] = ""
+            spec_stock_df["parsed_material"] = ""
+    else:
+        spec_stock_df["parsed_spec_code"] = ""
+        spec_stock_df["parsed_special_process"] = ""
+        spec_stock_df["parsed_material"] = ""
+
+    # =========================
+    # 3. 标准化显示字段
+    # =========================
+    spec_stock_df["display_spec_code"] = spec_stock_df.apply(
+        lambda r: (
+            _safe_text(r.get("parsed_spec_code"))
+            or _safe_text(r.get("spec_code"))
+            or _safe_text(r.get("product_spec_text"))
+            or "UNKNOWN_SPEC"
+        ),
+        axis=1
+    )
+
+    spec_stock_df["display_special_process_raw"] = spec_stock_df.apply(
+        lambda r: (
+            _safe_text(r.get("parsed_special_process"))
+            or _safe_text(r.get("raw_special_process"))
+            or _safe_text(r.get("order_special_process"))
+            or "STANDARD"
+        ),
+        axis=1
+    )
+
+    spec_stock_df["display_material"] = spec_stock_df.apply(
+        lambda r: (
+            _safe_text(r.get("parsed_material"))
+            or _safe_text(r.get("raw_material"))
+            or _safe_text(r.get("order_material"))
+            or "UNKNOWN_MATERIAL"
+        ),
+        axis=1
+    )
+
+    # 标准化字段：用于筛选和聚合
+    spec_stock_df["spec_code_norm"] = spec_stock_df["display_spec_code"].apply(_normalize_spec)
+    spec_stock_df["special_process_norm"] = spec_stock_df["display_special_process_raw"].apply(_normalize_process)
+    spec_stock_df["material_norm"] = spec_stock_df["display_material"].apply(_normalize_material)
+
+    # 页面显示字段
+    spec_stock_df["display_spec_code"] = spec_stock_df["spec_code_norm"]
+    spec_stock_df["display_special_process"] = spec_stock_df["special_process_norm"].apply(_process_display_label)
+    spec_stock_df["display_material"] = spec_stock_df["material_norm"]
+
+    spec_stock_df["variant_label"] = (
+        spec_stock_df["display_special_process"].astype(str)
+        + " / "
+        + spec_stock_df["display_material"].astype(str)
+    )
+
+    spec_stock_df["available_qty"] = pd.to_numeric(
+        spec_stock_df["available_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    spec_stock_df["reserved_qty"] = pd.to_numeric(
+        spec_stock_df["reserved_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    spec_stock_df["lot_total_qty"] = pd.to_numeric(
+        spec_stock_df["lot_total_qty"],
+        errors="coerce"
+    ).fillna(0)
+
+    # =========================
+    # 4. 总体指标
+    # =========================
+    total_qty = float(spec_stock_df["lot_total_qty"].sum())
+    available_qty = float(spec_stock_df["available_qty"].sum())
+    reserved_qty = float(spec_stock_df["reserved_qty"].sum())
+
+    variant_count = int(
+        spec_stock_df[
+            ["spec_code_norm", "special_process_norm", "material_norm"]
+        ].drop_duplicates().shape[0]
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("规格化库存总量", f"{total_qty:.0f}")
+    m2.metric("可用数量", f"{available_qty:.0f}")
+    m3.metric("预留数量", f"{reserved_qty:.0f}")
+    m4.metric("规格变体数", variant_count)
+
+    st.markdown("---")
+
+    # =========================
+    # 5. 三级联动筛选器
+    # =========================
+    st.markdown("#### 库存筛选")
+
+    spec_options = (
+        spec_stock_df["spec_code_norm"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    spec_options = ["全部规格"] + spec_options
+
+    f1, f2, f3 = st.columns(3)
+
+    with f1:
+        selected_spec = st.selectbox(
+            "① 产品规格",
+            spec_options,
+            index=0,
+            key=f"{section_key_prefix}_spec_filter"
+        )
+
+    # 根据规格联动工艺
+    process_base_df = spec_stock_df.copy()
+    if selected_spec != "全部规格":
+        process_base_df = process_base_df[
+            process_base_df["spec_code_norm"] == _normalize_spec(selected_spec)
+        ]
+
+    process_options_norm = (
+        process_base_df["special_process_norm"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    process_options = ["全部工艺"] + process_options_norm
+
+    with f2:
+        selected_process = st.selectbox(
+            "② 特殊工艺",
+            process_options,
+            index=0,
+            key=f"{section_key_prefix}_process_filter",
+            format_func=lambda x: "全部工艺" if x == "全部工艺" else _process_display_label(x)
+        )
+
+    # 根据规格 + 工艺联动材质
+    material_base_df = process_base_df.copy()
+    if selected_process != "全部工艺":
+        material_base_df = material_base_df[
+            material_base_df["special_process_norm"] == _normalize_process(selected_process)
+        ]
+
+    material_options = (
+        material_base_df["material_norm"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace("", pd.NA)
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    material_options = ["全部材质"] + material_options
+
+    with f3:
+        selected_material = st.selectbox(
+            "③ 材质",
+            material_options,
+            index=0,
+            key=f"{section_key_prefix}_material_filter"
+        )
+
+    # =========================
+    # 6. 应用筛选
+    # =========================
+    filtered_df = spec_stock_df.copy()
+
+    if selected_spec != "全部规格":
+        filtered_df = filtered_df[
+            filtered_df["spec_code_norm"] == _normalize_spec(selected_spec)
+        ]
+
+    if selected_process != "全部工艺":
+        filtered_df = filtered_df[
+            filtered_df["special_process_norm"] == _normalize_process(selected_process)
+        ]
+
+    if selected_material != "全部材质":
+        filtered_df = filtered_df[
+            filtered_df["material_norm"] == _normalize_material(selected_material)
+        ]
+
+    selected_total_qty = float(filtered_df["lot_total_qty"].sum()) if not filtered_df.empty else 0.0
+    selected_available_qty = float(filtered_df["available_qty"].sum()) if not filtered_df.empty else 0.0
+    selected_reserved_qty = float(filtered_df["reserved_qty"].sum()) if not filtered_df.empty else 0.0
+    selected_lot_count = int(filtered_df["inventory_lot_id"].nunique()) if not filtered_df.empty else 0
+
+    st.markdown("#### 当前筛选结果")
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("库存数量", f"{selected_total_qty:.0f}")
+    s2.metric("可用数量", f"{selected_available_qty:.0f}")
+    s3.metric("预留数量", f"{selected_reserved_qty:.0f}")
+    s4.metric("Lot 数", selected_lot_count)
+
+    if filtered_df.empty:
+        st.warning("当前筛选条件下没有规格化库存。")
+        return
+
+    # =========================
+    # 7. 根据筛选层级自动决定主展示表
+    # =========================
+    st.markdown("---")
+
+    only_all = (
+        selected_spec == "全部规格"
+        and selected_process == "全部工艺"
+        and selected_material == "全部材质"
+    )
+
+    selected_spec_only = (
+        selected_spec != "全部规格"
+        and selected_process == "全部工艺"
+        and selected_material == "全部材质"
+    )
+
+    selected_spec_process = (
+        selected_spec != "全部规格"
+        and selected_process != "全部工艺"
+        and selected_material == "全部材质"
+    )
+
+    selected_precise_pool = (
+        selected_spec != "全部规格"
+        and selected_process != "全部工艺"
+        and selected_material != "全部材质"
+    )
+
+    # =========================
+    # 7.1 未选择任何规格：显示所有规格总览
+    # =========================
+    if only_all:
+        st.subheader("所有规格库存总览")
+
+        main_df = (
+            filtered_df
+            .groupby(
+                [
+                    "spec_code_norm",
+                    "spec_desc",
+                    "product_name",
+                    "product_code",
+                ],
+                dropna=False
+            )
+            .agg(
+                variant_count=("variant_label", "nunique"),
+                lot_count=("inventory_lot_id", "nunique"),
+                available_qty=("available_qty", "sum"),
+                reserved_qty=("reserved_qty", "sum"),
+                lot_total_qty=("lot_total_qty", "sum"),
+            )
+            .reset_index()
+            .sort_values(["spec_code_norm"])
+        )
+
+        show_df(main_df.rename(columns={
+            "spec_code_norm": "产品规格",
+            "spec_desc": "规格描述",
+            "product_name": "产品名称",
+            "product_code": "产品编号",
+            "variant_count": "工艺/材质变体数",
+            "lot_count": "Lot数",
+            "available_qty": "可用数量",
+            "reserved_qty": "预留数量",
+            "lot_total_qty": "总数量",
+        }), hide_index=True)
+
+        with st.expander("查看全部 Lot 明细"):
+            _show_spec_lot_detail(filtered_df)
+
+    # =========================
+    # 7.2 只选择产品规格：显示该规格下工艺 / 材质分布
+    # =========================
+    elif selected_spec_only:
+        st.subheader(f"规格 {selected_spec} 下的工艺 / 材质库存分布")
+
+        main_df = (
+            filtered_df
+            .groupby(
+                [
+                    "spec_code_norm",
+                    "special_process_norm",
+                    "material_norm",
+                    "variant_label",
+                ],
+                dropna=False
+            )
+            .agg(
+                lot_count=("inventory_lot_id", "nunique"),
+                available_qty=("available_qty", "sum"),
+                reserved_qty=("reserved_qty", "sum"),
+                lot_total_qty=("lot_total_qty", "sum"),
+            )
+            .reset_index()
+            .sort_values(["special_process_norm", "material_norm"])
+        )
+
+        main_df["特殊工艺显示"] = main_df["special_process_norm"].apply(_process_display_label)
+
+        show_df(main_df.rename(columns={
+            "spec_code_norm": "产品规格",
+            "特殊工艺显示": "特殊工艺",
+            "material_norm": "材质",
+            "variant_label": "工艺 / 材质",
+            "lot_count": "Lot数",
+            "available_qty": "可用数量",
+            "reserved_qty": "预留数量",
+            "lot_total_qty": "总数量",
+        })[
+            [
+                "产品规格",
+                "特殊工艺",
+                "材质",
+                "工艺 / 材质",
+                "Lot数",
+                "可用数量",
+                "预留数量",
+                "总数量",
+            ]
+        ], hide_index=True)
+
+        with st.expander("查看该规格下全部 Lot 明细"):
+            _show_spec_lot_detail(filtered_df)
+
+    # =========================
+    # 7.3 选择规格 + 工艺：显示该工艺下材质分布
+    # =========================
+    elif selected_spec_process:
+        selected_process_label = _process_display_label(selected_process)
+
+        st.subheader(f"规格 {selected_spec} / 工艺 {selected_process_label} 下的材质库存分布")
+
+        main_df = (
+            filtered_df
+            .groupby(
+                [
+                    "spec_code_norm",
+                    "special_process_norm",
+                    "material_norm",
+                ],
+                dropna=False
+            )
+            .agg(
+                lot_count=("inventory_lot_id", "nunique"),
+                available_qty=("available_qty", "sum"),
+                reserved_qty=("reserved_qty", "sum"),
+                lot_total_qty=("lot_total_qty", "sum"),
+            )
+            .reset_index()
+            .sort_values(["material_norm"])
+        )
+
+        main_df["特殊工艺显示"] = main_df["special_process_norm"].apply(_process_display_label)
+
+        show_df(main_df.rename(columns={
+            "spec_code_norm": "产品规格",
+            "特殊工艺显示": "特殊工艺",
+            "material_norm": "材质",
+            "lot_count": "Lot数",
+            "available_qty": "可用数量",
+            "reserved_qty": "预留数量",
+            "lot_total_qty": "总数量",
+        })[
+            [
+                "产品规格",
+                "特殊工艺",
+                "材质",
+                "Lot数",
+                "可用数量",
+                "预留数量",
+                "总数量",
+            ]
+        ], hide_index=True)
+
+        with st.expander("查看该规格 + 工艺下全部 Lot 明细"):
+            _show_spec_lot_detail(filtered_df)
+
+    # =========================
+    # 7.4 精确到规格 + 工艺 + 材质：直接显示 Lot 明细
+    # =========================
+    elif selected_precise_pool:
+        selected_process_label = _process_display_label(selected_process)
+
+        st.subheader(
+            f"精确库存池：{selected_spec} / {selected_process_label} / {selected_material}"
+        )
+
+        if "build_spec_stock_group_key" in globals():
+            pool_key = build_spec_stock_group_key(
+                selected_spec,
+                selected_process,
+                selected_material
+            )
+        else:
+            pool_key = f"SPEC_STOCK__{selected_spec}__{selected_process}__{selected_material}"
+
+        st.markdown("规格化库存池 Key")
+        st.code(pool_key)
+
+        _show_spec_lot_detail(filtered_df)
+
+    # =========================
+    # 7.5 其他组合：直接展示当前筛选结果
+    # =========================
+    else:
+        st.subheader("当前筛选条件下的库存结果")
+
+        main_df = (
+            filtered_df
+            .groupby(
+                [
+                    "spec_code_norm",
+                    "special_process_norm",
+                    "material_norm",
+                    "variant_label",
+                ],
+                dropna=False
+            )
+            .agg(
+                lot_count=("inventory_lot_id", "nunique"),
+                available_qty=("available_qty", "sum"),
+                reserved_qty=("reserved_qty", "sum"),
+                lot_total_qty=("lot_total_qty", "sum"),
+            )
+            .reset_index()
+            .sort_values(["spec_code_norm", "special_process_norm", "material_norm"])
+        )
+
+        main_df["特殊工艺显示"] = main_df["special_process_norm"].apply(_process_display_label)
+
+        show_df(main_df.rename(columns={
+            "spec_code_norm": "产品规格",
+            "特殊工艺显示": "特殊工艺",
+            "material_norm": "材质",
+            "variant_label": "工艺 / 材质",
+            "lot_count": "Lot数",
+            "available_qty": "可用数量",
+            "reserved_qty": "预留数量",
+            "lot_total_qty": "总数量",
+        })[
+            [
+                "产品规格",
+                "特殊工艺",
+                "材质",
+                "工艺 / 材质",
+                "Lot数",
+                "可用数量",
+                "预留数量",
+                "总数量",
+            ]
+        ], hide_index=True)
+
+        with st.expander("查看当前筛选 Lot 明细"):
+            _show_spec_lot_detail(filtered_df)
 
 
 # =========================
@@ -22202,17 +22717,24 @@ def ensure_business_option_schema(conn):
 
     conn.commit()
 
-
 def get_business_options(conn, option_group, fallback_options=None):
     """
-    获取启用的业务选项。
+    获取业务选项。
+
+    special_process：
+    - 底层值统一为 STANDARD
+    - 页面显示可以通过 format_func 显示为 STANDARD（无特殊工艺）
+    - 不返回“无 / 无特殊工艺 / NONE”等重复选项
     """
     ensure_business_option_schema(conn)
 
     df = pd.read_sql_query("""
         SELECT
             option_value,
-            option_label
+            option_label,
+            is_enabled,
+            sort_order,
+            option_id
         FROM business_option
         WHERE option_group = ?
           AND is_enabled = 1
@@ -22220,17 +22742,48 @@ def get_business_options(conn, option_group, fallback_options=None):
     """, conn, params=[option_group])
 
     if df.empty:
+        if option_group == "special_process":
+            return ["STANDARD", "LASER", "CHAMFER", "DRILLING"]
         return fallback_options or []
 
-    return df["option_value"].astype(str).tolist()
+    values = []
+
+    for _, row in df.iterrows():
+        value = normalize_text(row["option_value"])
+
+        if option_group == "special_process":
+            value = normalize_special_process_value(value)
+        elif option_group == "material":
+            value = normalize_material_value(value)
+        else:
+            value = value.upper()
+
+        if value and value not in values:
+            values.append(value)
+
+    if option_group == "special_process":
+        if "STANDARD" not in values:
+            values.insert(0, "STANDARD")
+
+        # STANDARD 放最前面
+        values = ["STANDARD"] + [x for x in values if x != "STANDARD"]
+
+    return values
 
 
 def normalize_business_option(conn, option_group, value, default_value):
     """
     标准化业务选项：
-    - 如果输入值在系统选项里，返回标准值
-    - 如果不在，返回默认值
+    - special_process 使用全局 STANDARD / 无 统一规则
+    - material 使用大写标准化
+    - 其他选项保留原逻辑
     """
+    if option_group == "special_process":
+        return normalize_special_process_value(value)
+
+    if option_group == "material":
+        return normalize_material_value(value, default_value)
+
     options = get_business_options(conn, option_group, [default_value])
     text = normalize_text(value).upper()
 
@@ -22239,26 +22792,195 @@ def normalize_business_option(conn, option_group, value, default_value):
 
     return default_value
 
+
+def sync_standard_special_process_everywhere(conn):
+    """
+    全系统同步 STANDARD / 无 特殊工艺口径。
+
+    目标：
+    1. business_option 中只保留 STANDARD 作为无特殊工艺底层值
+    2. order_item.special_process 统一为 STANDARD
+    3. production_batch.special_process 统一为 STANDARD
+    4. Trace Key 中的 __无__ / __无特殊工艺__ / __NONE__ 统一替换为 __STANDARD__
+    5. 库存、出货、退货日志中的 trace_key 同步替换
+    """
+
+    conn.execute("PRAGMA busy_timeout = 30000")
+    cur = conn.cursor()
+
+    try:
+        ensure_business_option_schema(conn)
+
+        # 1. 确保 STANDARD 选项存在且启用
+        exists_df = pd.read_sql_query("""
+            SELECT COUNT(*) AS cnt
+            FROM business_option
+            WHERE option_group = 'special_process'
+              AND UPPER(option_value) = 'STANDARD'
+        """, conn)
+
+        if int(exists_df.iloc[0]["cnt"]) == 0:
+            cur.execute("""
+                INSERT INTO business_option (
+                    option_group,
+                    option_value,
+                    option_label,
+                    is_enabled,
+                    sort_order
+                ) VALUES ('special_process', 'STANDARD', ?, 1, 1)
+            """, (STANDARD_PROCESS_LABEL,))
+        else:
+            cur.execute("""
+                UPDATE business_option
+                SET option_value = 'STANDARD',
+                    option_label = ?,
+                    is_enabled = 1,
+                    sort_order = CASE
+                        WHEN sort_order IS NULL OR sort_order > 1 THEN 1
+                        ELSE sort_order
+                    END
+                WHERE option_group = 'special_process'
+                  AND UPPER(option_value) = 'STANDARD'
+            """, (STANDARD_PROCESS_LABEL,))
+
+        # 2. 停用重复的“无”类选项
+        duplicate_values = [
+            "无",
+            "无特殊工艺",
+            "NONE",
+            "NO",
+            "N/A",
+            "NA",
+            "STANDARD（无特殊工艺）",
+            "STANDARD(无特殊工艺)",
+        ]
+
+        for v in duplicate_values:
+            cur.execute("""
+                UPDATE business_option
+                SET is_enabled = 0
+                WHERE option_group = 'special_process'
+                  AND UPPER(option_value) = UPPER(?)
+            """, (v,))
+
+        # 3. 统一 order_item.special_process
+        cur.execute("""
+            UPDATE order_item
+            SET special_process = 'STANDARD'
+            WHERE special_process IS NULL
+               OR TRIM(special_process) = ''
+               OR UPPER(TRIM(special_process)) IN (
+                    'STANDARD',
+                    'NONE',
+                    'NO',
+                    'N/A',
+                    'NA',
+                    '无',
+                    '无特殊工艺',
+                    'STANDARD（无特殊工艺）',
+                    'STANDARD(无特殊工艺)'
+               )
+        """)
+
+        # 4. 统一 production_batch.special_process
+        cur.execute("""
+            UPDATE production_batch
+            SET special_process = 'STANDARD'
+            WHERE special_process IS NULL
+               OR TRIM(special_process) = ''
+               OR UPPER(TRIM(special_process)) IN (
+                    'STANDARD',
+                    'NONE',
+                    'NO',
+                    'N/A',
+                    'NA',
+                    '无',
+                    '无特殊工艺',
+                    'STANDARD（无特殊工艺）',
+                    'STANDARD(无特殊工艺)'
+               )
+        """)
+
+        # 5. Trace Key 字符串同步替换
+        # 注意：必须同步所有使用 trace_key 的表，避免链路断开。
+        trace_tables = [
+            ("order_item", "trace_key"),
+            ("production_batch", "trace_key"),
+            ("inventory_lot", "trace_key"),
+            ("shipment_item", "trace_key"),
+        ]
+
+        optional_tables = [
+            ("return_restock_log", "trace_key"),
+            ("return_hold_process_log", "source_trace_key"),
+        ]
+
+        existing_tables_df = pd.read_sql_query("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+        """, conn)
+
+        existing_tables = set(existing_tables_df["name"].tolist())
+
+        for table_name, col_name in trace_tables + optional_tables:
+            if table_name not in existing_tables:
+                continue
+
+            cols = pd.read_sql_query(f"PRAGMA table_info({table_name})", conn)["name"].tolist()
+            if col_name not in cols:
+                continue
+
+            replacements = [
+                ("__无__", "__STANDARD__"),
+                ("__无特殊工艺__", "__STANDARD__"),
+                ("__NONE__", "__STANDARD__"),
+                ("__NO__", "__STANDARD__"),
+                ("__N/A__", "__STANDARD__"),
+                ("__NA__", "__STANDARD__"),
+                ("__standard__", "__STANDARD__"),
+            ]
+
+            for old, new in replacements:
+                cur.execute(f"""
+                    UPDATE {table_name}
+                    SET {col_name} = REPLACE({col_name}, ?, ?)
+                    WHERE {col_name} LIKE ?
+                """, (
+                    old,
+                    new,
+                    f"%{old}%"
+                ))
+
+        conn.commit()
+        return True, "已完成 STANDARD / 无特殊工艺 全系统同步。"
+
+    except Exception as e:
+        conn.rollback()
+        return False, f"同步失败：{e}"
+
+
 def page_business_option_manager(conn):
     st.header("系统配置｜基础选项管理")
 
     ensure_business_option_schema(conn)
-    ensure_product_spec_manage_schema(conn)
 
     st.info(
         "这里用于维护订单录入中的基础选项。"
-        "特殊工艺和材质会进入下拉选项；产品规格会写入产品规格主数据，并自动出现在订单录入页面。"
+        "系统已统一特殊工艺口径：无 / 无特殊工艺 / NONE / STANDARD 都按 STANDARD 存储，"
+        "页面显示为 STANDARD（无特殊工艺）。"
     )
 
-    tab_list, tab_add, tab_manage, tab_spec = st.tabs([
+    tab_list, tab_add, tab_manage, tab_sync, tab_spec = st.tabs([
         "当前选项",
         "新增选项",
         "启用 / 停用",
+        "统一 / 同步",
         "产品规格管理"
     ])
 
     # =========================
-    # 1. 当前选项
+    # 当前选项
     # =========================
     with tab_list:
         st.subheader("当前基础选项")
@@ -22277,360 +22999,118 @@ def page_business_option_manager(conn):
         """, conn)
 
         if option_df.empty:
-            st.info("当前没有特殊工艺 / 材质基础选项。")
+            st.info("当前没有基础选项。")
         else:
-            option_df["option_group_cn"] = option_df["option_group"].map({
-                "special_process": "特殊工艺",
-                "material": "材质"
-            }).fillna(option_df["option_group"])
+            option_df = option_df.copy()
+
+            def _display_option_label(row):
+                group = normalize_text(row.get("option_group"))
+                value = normalize_text(row.get("option_value"))
+
+                if group == "special_process":
+                    return display_special_process_label(value)
+
+                return normalize_text(row.get("option_label")) or value
+
+            option_df["display_label"] = option_df.apply(_display_option_label, axis=1)
 
             show_df(option_df.rename(columns={
                 "option_id": "选项编号",
-                "option_group_cn": "选项类别",
-                "option_value": "选项值",
-                "option_label": "显示名称",
+                "option_group": "选项类别",
+                "option_value": "底层选项值",
+                "option_label": "原显示名称",
+                "display_label": "页面显示名称",
                 "is_enabled": "是否启用",
                 "sort_order": "排序",
                 "created_at": "创建时间"
             }), hide_index=True)
 
-        st.markdown("---")
-        st.subheader("当前产品规格")
-
-        spec_df = pd.read_sql_query("""
-            SELECT
-                ps.spec_id,
-                p.product_id,
-                p.product_name,
-                p.product_code,
-                COALESCE(p.category, '') AS category,
-                ps.spec_code,
-                ps.spec_desc,
-                ps.outer_diameter_mm,
-                ps.wall_thickness_mm,
-                ps.length_mm,
-                COALESCE(p.is_enabled, 1) AS product_enabled,
-                COALESCE(ps.is_enabled, 1) AS spec_enabled
-            FROM product_spec ps
-            JOIN product p
-                ON ps.product_id = p.product_id
-            ORDER BY
-                COALESCE(ps.is_enabled, 1) DESC,
-                p.product_name,
-                ps.spec_code
-        """, conn)
-
-        if spec_df.empty:
-            st.info("当前没有产品规格。")
-        else:
-            show_df(spec_df.rename(columns={
-                "spec_id": "规格编号",
-                "product_id": "产品编号",
-                "product_name": "产品名称",
-                "product_code": "产品编码",
-                "category": "产品分类",
-                "spec_code": "规格编码",
-                "spec_desc": "规格描述",
-                "outer_diameter_mm": "外径(mm)",
-                "wall_thickness_mm": "壁厚(mm)",
-                "length_mm": "长度(mm)",
-                "product_enabled": "产品启用",
-                "spec_enabled": "规格启用"
-            }), hide_index=True)
+            st.caption(
+                "说明：特殊工艺中，STANDARD 是唯一的无特殊工艺底层值；"
+                "页面显示为 STANDARD（无特殊工艺）。"
+            )
 
     # =========================
-    # 2. 新增选项
+    # 新增选项
     # =========================
     with tab_add:
         st.subheader("新增基础选项")
 
         option_group_cn = st.selectbox(
             "选项类别",
-            ["特殊工艺", "材质", "产品规格"],
+            ["特殊工艺", "材质"],
             key="business_option_group_cn"
         )
 
-        # =========================
-        # 2.1 新增特殊工艺 / 材质
-        # =========================
-        if option_group_cn in ["特殊工艺", "材质"]:
-            option_group = "special_process" if option_group_cn == "特殊工艺" else "material"
+        option_group = "special_process" if option_group_cn == "特殊工艺" else "material"
 
-            option_value = st.text_input(
-                "选项值",
-                placeholder="例如：POLISHING / ALUMINO-SILICATE",
-                key="business_option_value"
-            )
+        option_value = st.text_input(
+            "选项值",
+            placeholder="例如：POLISHING / ALUMINO-SILICATE",
+            key="business_option_value"
+        )
 
-            option_label = st.text_input(
-                "显示名称",
-                placeholder="通常和选项值一致",
-                key="business_option_label"
-            )
+        option_label = st.text_input(
+            "显示名称",
+            placeholder="通常和选项值一致",
+            key="business_option_label"
+        )
 
-            sort_order = st.number_input(
-                "排序",
-                min_value=1,
-                value=100,
-                step=10,
-                key="business_option_sort_order"
-            )
+        sort_order = st.number_input(
+            "排序",
+            min_value=1,
+            value=100,
+            step=10,
+            key="business_option_sort_order"
+        )
 
-            if st.button("新增选项", key="add_business_option"):
-                value_clean = normalize_text(option_value).upper()
+        if st.button("新增选项", key="add_business_option"):
+            value_clean = normalize_text(option_value)
+
+            if option_group == "special_process":
+                value_clean = normalize_special_process_value(value_clean)
+                label_clean = display_special_process_label(value_clean)
+            else:
+                value_clean = normalize_material_value(value_clean)
                 label_clean = normalize_text(option_label).upper() or value_clean
 
-                if not value_clean:
-                    st.error("请填写选项值。")
-                    return
+            if not value_clean:
+                st.error("请填写选项值。")
+                return
 
-                exists_df = pd.read_sql_query("""
-                    SELECT COUNT(*) AS cnt
-                    FROM business_option
-                    WHERE option_group = ?
-                      AND option_value = ?
-                """, conn, params=[option_group, value_clean])
+            exists_df = pd.read_sql_query("""
+                SELECT COUNT(*) AS cnt
+                FROM business_option
+                WHERE option_group = ?
+                  AND UPPER(option_value) = UPPER(?)
+            """, conn, params=[option_group, value_clean])
 
-                if int(exists_df.iloc[0]["cnt"] or 0) > 0:
-                    st.error("该选项已经存在。")
-                    return
+            if int(exists_df.iloc[0]["cnt"]) > 0:
+                st.warning("该选项已存在。")
+                return
 
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO business_option (
-                        option_group,
-                        option_value,
-                        option_label,
-                        is_enabled,
-                        sort_order
-                    ) VALUES (?, ?, ?, 1, ?)
-                """, (
+            conn.execute("""
+                INSERT INTO business_option (
                     option_group,
-                    value_clean,
-                    label_clean,
-                    int(sort_order)
-                ))
+                    option_value,
+                    option_label,
+                    is_enabled,
+                    sort_order
+                ) VALUES (?, ?, ?, 1, ?)
+            """, (
+                option_group,
+                value_clean,
+                label_clean,
+                int(sort_order)
+            ))
 
-                conn.commit()
-                st.success(f"已新增选项：{value_clean}")
-                st.rerun()
-
-        # =========================
-        # 2.2 新增产品规格
-        # =========================
-        else:
-            st.markdown("### 新增产品规格")
-
-            existing_product_df = pd.read_sql_query("""
-                SELECT
-                    product_id,
-                    product_name,
-                    COALESCE(product_code, '') AS product_code,
-                    COALESCE(category, '') AS category,
-                    COALESCE(is_enabled, 1) AS is_enabled
-                FROM product
-                ORDER BY product_name, product_id
-            """, conn)
-
-            product_source = st.radio(
-                "产品来源",
-                ["选择已有产品", "新增产品"],
-                horizontal=True,
-                key="spec_product_source"
-            )
-
-            product_id = None
-
-            if product_source == "选择已有产品":
-                if existing_product_df.empty:
-                    st.warning("当前没有已有产品，请选择【新增产品】。")
-                    product_source = "新增产品"
-                else:
-                    product_id = st.selectbox(
-                        "选择产品",
-                        existing_product_df["product_id"].tolist(),
-                        format_func=lambda x: (
-                            f"{existing_product_df.loc[existing_product_df['product_id'] == x, 'product_name'].iloc[0]}"
-                            f"｜{existing_product_df.loc[existing_product_df['product_id'] == x, 'product_code'].iloc[0]}"
-                        ),
-                        key="spec_existing_product_id"
-                    )
-
-            if product_source == "新增产品":
-                c1, c2, c3 = st.columns(3)
-
-                with c1:
-                    new_product_name = st.text_input(
-                        "产品名称",
-                        placeholder="例如：Glass Tube",
-                        key="spec_new_product_name"
-                    )
-
-                with c2:
-                    new_product_code = st.text_input(
-                        "产品编码",
-                        placeholder="例如：PROD-GLASS-TUBE",
-                        key="spec_new_product_code"
-                    )
-
-                with c3:
-                    new_category = st.text_input(
-                        "产品分类",
-                        value="Glass Tube",
-                        key="spec_new_product_category"
-                    )
-
-            st.markdown("---")
-
-            s1, s2, s3 = st.columns(3)
-
-            with s1:
-                spec_code = st.text_input(
-                    "规格编码",
-                    placeholder="例如：SPEC-A-20x2x1500",
-                    key="new_spec_code"
-                )
-
-                outer_diameter_mm = st.number_input(
-                    "外径(mm)",
-                    min_value=0.0,
-                    value=20.0,
-                    step=0.1,
-                    key="new_spec_outer_diameter"
-                )
-
-            with s2:
-                spec_desc = st.text_input(
-                    "规格描述",
-                    placeholder="例如：20mm OD x 2mm WT x 1500mm L",
-                    key="new_spec_desc"
-                )
-
-                wall_thickness_mm = st.number_input(
-                    "壁厚(mm)",
-                    min_value=0.0,
-                    value=2.0,
-                    step=0.1,
-                    key="new_spec_wall_thickness"
-                )
-
-            with s3:
-                length_mm = st.number_input(
-                    "长度(mm)",
-                    min_value=0.0,
-                    value=1500.0,
-                    step=1.0,
-                    key="new_spec_length"
-                )
-
-                spec_enabled = st.radio(
-                    "是否启用",
-                    [1, 0],
-                    format_func=lambda x: "启用" if x == 1 else "停用",
-                    horizontal=True,
-                    index=0,
-                    key="new_spec_enabled"
-                )
-
-            if st.button("新增产品规格", key="add_product_spec_from_option"):
-                spec_code_clean = normalize_text(spec_code).upper()
-                spec_desc_clean = normalize_text(spec_desc)
-
-                if not spec_code_clean:
-                    st.error("请填写规格编码。")
-                    return
-
-                cursor = conn.cursor()
-
-                try:
-                    # 如果是新增产品，先写 product
-                    if product_source == "新增产品":
-                        product_name_clean = normalize_text(new_product_name)
-
-                        if not product_name_clean:
-                            st.error("请填写产品名称。")
-                            return
-
-                        product_code_clean = normalize_text(new_product_code).upper()
-                        if not product_code_clean:
-                            product_code_clean = f"PROD-{product_name_clean.upper().replace(' ', '-')}"
-
-                        category_clean = normalize_text(new_category) or "Glass Tube"
-
-                        product_exists_df = pd.read_sql_query("""
-                            SELECT product_id
-                            FROM product
-                            WHERE product_name = ?
-                               OR product_code = ?
-                            LIMIT 1
-                        """, conn, params=[
-                            product_name_clean,
-                            product_code_clean
-                        ])
-
-                        if product_exists_df.empty:
-                            cursor.execute("""
-                                INSERT INTO product (
-                                    product_name,
-                                    product_code,
-                                    category,
-                                    is_enabled
-                                ) VALUES (?, ?, ?, 1)
-                            """, (
-                                product_name_clean,
-                                product_code_clean,
-                                category_clean
-                            ))
-                            product_id_use = cursor.lastrowid
-                        else:
-                            product_id_use = int(product_exists_df.iloc[0]["product_id"])
-
-                    else:
-                        product_id_use = int(product_id)
-
-                    # 检查规格是否重复
-                    spec_exists_df = pd.read_sql_query("""
-                        SELECT COUNT(*) AS cnt
-                        FROM product_spec
-                        WHERE spec_code = ?
-                    """, conn, params=[spec_code_clean])
-
-                    if int(spec_exists_df.iloc[0]["cnt"] or 0) > 0:
-                        st.error("该规格编码已存在。")
-                        return
-
-                    cursor.execute("""
-                        INSERT INTO product_spec (
-                            product_id,
-                            spec_code,
-                            spec_desc,
-                            outer_diameter_mm,
-                            wall_thickness_mm,
-                            length_mm,
-                            is_enabled
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        int(product_id_use),
-                        spec_code_clean,
-                        spec_desc_clean,
-                        float(outer_diameter_mm),
-                        float(wall_thickness_mm),
-                        float(length_mm),
-                        int(spec_enabled)
-                    ))
-
-                    conn.commit()
-
-                    st.success(f"产品规格已新增：{spec_code_clean}")
-                    st.rerun()
-
-                except Exception as e:
-                    conn.rollback()
-                    st.error(f"新增产品规格失败：{e}")
-                    return
+            conn.commit()
+            st.cache_data.clear()
+            st.success(f"已新增选项：{label_clean}")
+            st.rerun()
 
     # =========================
-    # 3. 启用 / 停用特殊工艺、材质
+    # 启用 / 停用
     # =========================
     with tab_manage:
         st.subheader("启用 / 停用特殊工艺、材质")
@@ -22641,202 +23121,189 @@ def page_business_option_manager(conn):
                 option_group,
                 option_value,
                 option_label,
-                is_enabled,
-                sort_order
+                is_enabled
             FROM business_option
-            ORDER BY option_group, sort_order, option_id
+            ORDER BY option_group, option_value
         """, conn)
 
         if option_df.empty:
-            st.info("当前没有可管理的选项。")
+            st.info("当前没有可管理选项。")
         else:
+            option_df = option_df.copy()
+
+            option_df["display_label"] = option_df.apply(
+                lambda r: (
+                    display_special_process_label(r["option_value"])
+                    if normalize_text(r["option_group"]) == "special_process"
+                    else normalize_text(r["option_label"]) or normalize_text(r["option_value"])
+                ),
+                axis=1
+            )
+
+            option_df["manage_label"] = option_df.apply(
+                lambda r: (
+                    f"{r['option_group']} | {r['display_label']} | "
+                    f"{'启用' if int(r['is_enabled']) == 1 else '停用'}"
+                ),
+                axis=1
+            )
+
             selected_option_id = st.selectbox(
                 "选择选项",
                 option_df["option_id"].tolist(),
-                format_func=lambda x: (
-                    f"{option_df.loc[option_df['option_id'] == x, 'option_group'].iloc[0]} | "
-                    f"{option_df.loc[option_df['option_id'] == x, 'option_value'].iloc[0]} | "
-                    f"{'启用' if int(option_df.loc[option_df['option_id'] == x, 'is_enabled'].iloc[0] or 0) == 1 else '停用'}"
-                ),
-                key="manage_business_option_select"
+                format_func=lambda x: option_df.loc[
+                    option_df["option_id"] == x,
+                    "manage_label"
+                ].iloc[0],
+                key="business_option_manage_select"
             )
 
-            selected = option_df[option_df["option_id"] == selected_option_id].iloc[0]
+            selected_row = option_df[
+                option_df["option_id"] == selected_option_id
+            ].iloc[0]
+
+            st.markdown("#### 当前选项信息")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("类别", selected_row["option_group"])
+            c2.metric("底层值", selected_row["option_value"])
+            c3.metric("显示名称", selected_row["display_label"])
+            c4.metric("状态", "启用" if int(selected_row["is_enabled"]) == 1 else "停用")
+
+            if normalize_text(selected_row["option_group"]) == "special_process":
+                normalized_value = normalize_special_process_value(selected_row["option_value"])
+                if normalized_value == "STANDARD" and normalize_text(selected_row["option_value"]).upper() != "STANDARD":
+                    st.warning(
+                        "该选项属于“无特殊工艺”的重复写法。建议使用【统一 / 同步】功能将它合并到 STANDARD。"
+                    )
 
             new_enabled = st.radio(
-                "状态",
+                "设置状态",
                 [1, 0],
                 format_func=lambda x: "启用" if x == 1 else "停用",
                 horizontal=True,
-                index=0 if int(selected["is_enabled"] or 0) == 1 else 1,
-                key="manage_business_option_enabled"
+                key="business_option_new_enabled"
             )
 
-            new_sort_order = st.number_input(
-                "排序",
-                min_value=1,
-                value=int(selected["sort_order"] or 100),
-                step=10,
-                key="manage_business_option_sort"
-            )
+            if st.button("保存启用状态", key="save_business_option_enabled"):
+                # 不允许停用 STANDARD
+                if (
+                    normalize_text(selected_row["option_group"]) == "special_process"
+                    and normalize_special_process_value(selected_row["option_value"]) == "STANDARD"
+                    and int(new_enabled) == 0
+                ):
+                    st.error("STANDARD（无特殊工艺）是系统基础选项，不建议停用。")
+                    return
 
-            if st.button("保存修改", key="save_business_option_manage"):
-                cursor = conn.cursor()
-                cursor.execute("""
+                conn.execute("""
                     UPDATE business_option
-                    SET is_enabled = ?,
-                        sort_order = ?
+                    SET is_enabled = ?
                     WHERE option_id = ?
                 """, (
                     int(new_enabled),
-                    int(new_sort_order),
                     int(selected_option_id)
                 ))
 
                 conn.commit()
-                st.success("选项已更新。")
+                st.cache_data.clear()
+                st.success("已更新选项状态。")
                 st.rerun()
 
     # =========================
-    # 4. 产品规格管理
+    # 统一 / 同步
+    # =========================
+    with tab_sync:
+        st.subheader("STANDARD / 无特殊工艺 统一同步")
+
+        st.warning(
+            "该功能会把系统中的【无 / 无特殊工艺 / NONE / NO / NA】统一为 STANDARD，"
+            "并将页面显示名称统一为 STANDARD（无特殊工艺）。建议保存代码和数据库后再执行。"
+        )
+
+        check_df = pd.read_sql_query("""
+            SELECT
+                'order_item' AS table_name,
+                special_process,
+                COUNT(*) AS cnt
+            FROM order_item
+            GROUP BY special_process
+
+            UNION ALL
+
+            SELECT
+                'production_batch' AS table_name,
+                special_process,
+                COUNT(*) AS cnt
+            FROM production_batch
+            GROUP BY special_process
+
+            UNION ALL
+
+            SELECT
+                'business_option' AS table_name,
+                option_value AS special_process,
+                COUNT(*) AS cnt
+            FROM business_option
+            WHERE option_group = 'special_process'
+            GROUP BY option_value
+        """, conn)
+
+        st.markdown("#### 当前特殊工艺分布")
+        if check_df.empty:
+            st.info("当前没有特殊工艺数据。")
+        else:
+            display_df = check_df.copy()
+            display_df["统一后底层值"] = display_df["special_process"].apply(normalize_special_process_value)
+            display_df["统一后显示"] = display_df["special_process"].apply(display_special_process_label)
+
+            show_df(display_df.rename(columns={
+                "table_name": "数据表",
+                "special_process": "当前值",
+                "cnt": "数量",
+            }), hide_index=True)
+
+        if st.button("一键统一 STANDARD / 无特殊工艺", key="sync_standard_special_process_everywhere"):
+            ok, msg = sync_standard_special_process_everywhere(conn)
+
+            if ok:
+                st.cache_data.clear()
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # =========================
+    # 产品规格管理
     # =========================
     with tab_spec:
         st.subheader("产品规格管理")
 
-        spec_df = pd.read_sql_query("""
-            SELECT
-                ps.spec_id,
-                p.product_id,
-                p.product_name,
-                p.product_code,
-                COALESCE(p.category, '') AS category,
-                ps.spec_code,
-                ps.spec_desc,
-                ps.outer_diameter_mm,
-                ps.wall_thickness_mm,
-                ps.length_mm,
-                COALESCE(p.is_enabled, 1) AS product_enabled,
-                COALESCE(ps.is_enabled, 1) AS spec_enabled
-            FROM product_spec ps
-            JOIN product p
-                ON ps.product_id = p.product_id
-            ORDER BY
-                COALESCE(ps.is_enabled, 1) DESC,
-                p.product_name,
-                ps.spec_code
-        """, conn)
+        if "page_product_spec_manager_inner" in globals():
+            page_product_spec_manager_inner(conn)
+        else:
+            spec_df = pd.read_sql_query("""
+                SELECT
+                    ps.spec_id,
+                    p.product_code,
+                    p.product_name,
+                    ps.spec_code,
+                    ps.spec_desc
+                FROM product_spec ps
+                LEFT JOIN product p
+                    ON ps.product_id = p.product_id
+                ORDER BY ps.spec_id DESC
+            """, conn)
 
-        if spec_df.empty:
-            st.info("当前没有产品规格。")
-            return
-
-        selected_spec_id = st.selectbox(
-            "选择产品规格",
-            spec_df["spec_id"].tolist(),
-            format_func=lambda x: (
-                f"{spec_df.loc[spec_df['spec_id'] == x, 'product_name'].iloc[0]} | "
-                f"{spec_df.loc[spec_df['spec_id'] == x, 'spec_code'].iloc[0]} | "
-                f"{'启用' if int(spec_df.loc[spec_df['spec_id'] == x, 'spec_enabled'].iloc[0] or 0) == 1 else '停用'}"
-            ),
-            key="manage_product_spec_select"
-        )
-
-        selected_spec = spec_df[spec_df["spec_id"] == selected_spec_id].iloc[0]
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            edit_spec_code = st.text_input(
-                "规格编码",
-                value=str(selected_spec["spec_code"]),
-                key="edit_spec_code"
-            )
-
-            edit_outer_diameter = st.number_input(
-                "外径(mm)",
-                min_value=0.0,
-                value=float(selected_spec["outer_diameter_mm"] or 0),
-                step=0.1,
-                key="edit_outer_diameter"
-            )
-
-        with c2:
-            edit_spec_desc = st.text_input(
-                "规格描述",
-                value=str(selected_spec["spec_desc"]) if pd.notna(selected_spec["spec_desc"]) else "",
-                key="edit_spec_desc"
-            )
-
-            edit_wall_thickness = st.number_input(
-                "壁厚(mm)",
-                min_value=0.0,
-                value=float(selected_spec["wall_thickness_mm"] or 0),
-                step=0.1,
-                key="edit_wall_thickness"
-            )
-
-        with c3:
-            edit_length = st.number_input(
-                "长度(mm)",
-                min_value=0.0,
-                value=float(selected_spec["length_mm"] or 0),
-                step=1.0,
-                key="edit_length"
-            )
-
-            edit_spec_enabled = st.radio(
-                "规格状态",
-                [1, 0],
-                format_func=lambda x: "启用" if x == 1 else "停用",
-                horizontal=True,
-                index=0 if int(selected_spec["spec_enabled"] or 0) == 1 else 1,
-                key="edit_spec_enabled"
-            )
-
-        if st.button("保存产品规格修改", key="save_product_spec_manage"):
-            spec_code_clean = normalize_text(edit_spec_code).upper()
-
-            if not spec_code_clean:
-                st.error("规格编码不能为空。")
-                return
-
-            duplicate_df = pd.read_sql_query("""
-                SELECT COUNT(*) AS cnt
-                FROM product_spec
-                WHERE spec_id <> ?
-                  AND spec_code = ?
-            """, conn, params=[
-                int(selected_spec_id),
-                spec_code_clean
-            ])
-
-            if int(duplicate_df.iloc[0]["cnt"] or 0) > 0:
-                st.error("其他产品规格已使用相同规格编码。")
-                return
-
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE product_spec
-                SET spec_code = ?,
-                    spec_desc = ?,
-                    outer_diameter_mm = ?,
-                    wall_thickness_mm = ?,
-                    length_mm = ?,
-                    is_enabled = ?
-                WHERE spec_id = ?
-            """, (
-                spec_code_clean,
-                normalize_text(edit_spec_desc),
-                float(edit_outer_diameter),
-                float(edit_wall_thickness),
-                float(edit_length),
-                int(edit_spec_enabled),
-                int(selected_spec_id)
-            ))
-
-            conn.commit()
-            st.success("产品规格已更新。")
-            st.rerun()
+            if spec_df.empty:
+                st.info("当前没有产品规格。")
+            else:
+                show_df(spec_df.rename(columns={
+                    "spec_id": "规格编号",
+                    "product_code": "产品编号",
+                    "product_name": "产品名称",
+                    "spec_code": "规格编码",
+                    "spec_desc": "规格描述",
+                }), hide_index=True)
 
 # =========================
 # 客户主数据管理
