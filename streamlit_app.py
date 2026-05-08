@@ -10806,31 +10806,25 @@ def push_delivery_plan_to_production(conn, delivery_plan_id):
         action_choice="自动判断"
     )
 
-
 def page_sales_dashboard(conn):
     """
-    销售看板
+    销售看板｜库存判断 + 推送排产 + 推送出货
 
-    修正版重点：
-    1. 销售看板中的 WH-SPEC 规格化库存计算，统一使用：
-       产品规格 + 特殊工艺 + 材质
-    2. 兼容旧 Trace Key：
+    当前版本重点：
+    1. WH-ORDER：按订单 Trace Key 严格匹配。
+    2. WH-SPEC：按【产品规格 + 特殊工艺 + 材质】统一匹配。
        - STANDARD / 无 / 无特殊工艺 → STANDARD
        - SPDA-LIME / spda-lime → SODA-LIME
        - UNKNOWN-MATERIAL → UNKNOWN_MATERIAL
-    3. 不再只用 trace_key = SPEC_STOCK__... 精确匹配，
-       避免漏掉旧订单退货再上架、旧批次转入 WH-SPEC 的库存。
-    4. 销售看板会显示：
-       - 计划交付数量
-       - 已交付数量
-       - 剩余待满足
-       - 成品缺口
-       - WH-ORDER 订单库存
-       - WH-SPEC 规格化库存
-       - 成品库存合计
-       - 半成品数量
-       - 是否需要生产
-       - 是否需要半成品出库
+    3. 成品库存足够：
+       - delivery_plan.delivery_status = '发货准备'
+       - 推送至出货管理
+    4. 成品库存不足：
+       - 点击按钮后 delivery_plan.delivery_status = '待生产确认'
+       - order_item.item_status = '待生产确认'
+       - orders.order_status = 'production_required'
+       - 可被【生产管理 → 排产看板 → 销售推送待确认】查询到
+    5. 调试区避免重复中文列名导致 Streamlit 报错。
     """
 
     st.header("销售看板")
@@ -10893,10 +10887,8 @@ def page_sales_dashboard(conn):
             return display_special_process_label(v)
 
         value = _normalize_process(v)
-
         if value == "STANDARD":
             return "STANDARD（无特殊工艺）"
-
         return value
 
     def _normalize_material(v):
@@ -10920,6 +10912,23 @@ def page_sales_dashboard(conn):
         }
 
         return material_map.get(value, value if value else "UNKNOWN_MATERIAL")
+
+    def _ensure_sales_need_production_column():
+        """
+        可选兼容字段：
+        如果 production_dashboard 后续使用 sales_need_production 标记，
+        这里自动补列并写入 1。
+        """
+        try:
+            cols = pd.read_sql_query("PRAGMA table_info(delivery_plan)", conn)["name"].tolist()
+            if "sales_need_production" not in cols:
+                conn.execute("""
+                    ALTER TABLE delivery_plan
+                    ADD COLUMN sales_need_production INTEGER DEFAULT 0
+                """)
+                conn.commit()
+        except Exception:
+            pass
 
     def _parse_inventory_variant(row):
         """
@@ -10976,15 +10985,8 @@ def page_sales_dashboard(conn):
 
     def _get_available_wh_spec_qty_by_variant(spec_id, spec_code, special_process, material):
         """
-        销售看板专用：按 产品规格 + 特殊工艺 + 材质 统一计算 WH-SPEC 可用库存。
-
-        这个函数和库存页面口径一致：
-        - 先查同 spec_id 的 WH-SPEC Lot
-        - 再解析 trace_key
-        - 再统一规格 / 工艺 / 材质
-        - 最后汇总 available_qty
+        按 产品规格 + 特殊工艺 + 材质 统一计算 WH-SPEC 可用库存。
         """
-
         target_spec = _normalize_spec(spec_code)
         target_process = _normalize_process(special_process)
         target_material = _normalize_material(material)
@@ -11067,7 +11069,7 @@ def page_sales_dashboard(conn):
     def _get_available_wh_order_qty(order_trace_key):
         """
         订单库存 WH-ORDER：
-        仍然严格按订单 Trace Key 查询。
+        严格按订单 Trace Key 查询。
         """
         df = pd.read_sql_query("""
             SELECT
@@ -11085,33 +11087,9 @@ def page_sales_dashboard(conn):
 
         return _safe_float(df.iloc[0]["qty"])
 
-    def _get_semi_finished_qty(production_batch_id):
-        """
-        半成品数量：
-        用于判断是否可以进入质检 / 入库。
-        如果你的系统里半成品库存字段不同，可以按你现有字段调整。
-        """
-        if production_batch_id is None or pd.isna(production_batch_id):
-            return 0.0
-
-        try:
-            df = pd.read_sql_query("""
-                SELECT
-                    COALESCE(SUM(semi_finished_wh_qty), 0) AS qty
-                FROM production_batch
-                WHERE production_batch_id = ?
-            """, conn, params=[int(production_batch_id)])
-
-            if df.empty:
-                return 0.0
-
-            return _safe_float(df.iloc[0]["qty"])
-
-        except Exception:
-            return 0.0
-
     # =========================
-    # 1. 读取交付批次销售看板基础数据
+    # 1. 读取销售看板基础数据
+    # 注意：不要使用 pb.planned_qty / pb.batch_qty，避免字段不存在报错。
     # =========================
     dashboard_df = pd.read_sql_query("""
         SELECT
@@ -11135,6 +11113,7 @@ def page_sales_dashboard(conn):
             COALESCE(oi.material, 'UNKNOWN_MATERIAL') AS material,
             COALESCE(oi.ordered_qty, 0) AS ordered_qty,
             COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
+            COALESCE(oi.item_status, '') AS item_status,
 
             o.order_status,
             o.order_date,
@@ -11184,13 +11163,16 @@ def page_sales_dashboard(conn):
         ORDER BY
             CASE COALESCE(dp.delivery_status, '未排产')
                 WHEN '未排产' THEN 1
-                WHEN '已排产' THEN 2
-                WHEN '生产中' THEN 3
-                WHEN '已入库' THEN 4
-                WHEN '发货准备' THEN 5
-                WHEN '部分出货' THEN 6
-                WHEN '已出货' THEN 7
-                ELSE 9
+                WHEN '待生产确认' THEN 2
+                WHEN '已排产' THEN 3
+                WHEN '生产中' THEN 4
+                WHEN '质检中' THEN 5
+                WHEN '待入库确认' THEN 6
+                WHEN '已入库' THEN 7
+                WHEN '发货准备' THEN 8
+                WHEN '部分出货' THEN 9
+                WHEN '已出货' THEN 10
+                ELSE 99
             END,
             dp.planned_delivery_date,
             dp.delivery_plan_id DESC
@@ -11223,7 +11205,6 @@ def page_sales_dashboard(conn):
     dashboard_df["special_process_norm"] = dashboard_df["special_process"].apply(_normalize_process)
     dashboard_df["material_norm"] = dashboard_df["material"].apply(_normalize_material)
     dashboard_df["spec_code_norm"] = dashboard_df["spec_code"].apply(_normalize_spec)
-
     dashboard_df["special_process_display"] = dashboard_df["special_process_norm"].apply(_display_process)
 
     wh_order_qty_list = []
@@ -11231,14 +11212,14 @@ def page_sales_dashboard(conn):
     wh_spec_lot_count_list = []
     semi_finished_qty_list = []
 
-    for _, row in dashboard_df.iterrows():
-        wh_order_qty = _get_available_wh_order_qty(row.get("trace_key"))
+    for _, row_i in dashboard_df.iterrows():
+        wh_order_qty = _get_available_wh_order_qty(row_i.get("trace_key"))
 
         wh_spec_qty, wh_spec_match_df = _get_available_wh_spec_qty_by_variant(
-            spec_id=int(row["spec_id"]),
-            spec_code=row.get("spec_code"),
-            special_process=row.get("special_process"),
-            material=row.get("material")
+            spec_id=int(row_i["spec_id"]),
+            spec_code=row_i.get("spec_code"),
+            special_process=row_i.get("special_process"),
+            material=row_i.get("material")
         )
 
         if wh_spec_match_df is not None and not wh_spec_match_df.empty:
@@ -11246,7 +11227,7 @@ def page_sales_dashboard(conn):
         else:
             wh_spec_lot_count = 0
 
-        semi_finished_qty = _safe_float(row.get("semi_finished_wh_qty"))
+        semi_finished_qty = _safe_float(row_i.get("semi_finished_wh_qty"))
 
         wh_order_qty_list.append(wh_order_qty)
         wh_spec_qty_list.append(wh_spec_qty)
@@ -11289,7 +11270,7 @@ def page_sales_dashboard(conn):
                 "已完成出货"
                 if _safe_float(r["remaining_qty"]) <= 0
                 else (
-                    "成品不足，可检查半成品 / 安排生产"
+                    "成品不足，需要发送至排产看板"
                     if _safe_float(r["finished_gap"]) > 0
                     else "待处理"
                 )
@@ -11417,7 +11398,7 @@ def page_sales_dashboard(conn):
             "material_norm",
         ]
 
-        mask = False
+        mask = pd.Series(False, index=filtered_df.index)
 
         for col in search_cols:
             if col in filtered_df.columns:
@@ -11470,7 +11451,9 @@ def page_sales_dashboard(conn):
         if c in filtered_df.columns
     ]
 
-    show_df(filtered_df[existing_cols].rename(columns={
+    sales_overview_df = filtered_df[existing_cols].copy()
+
+    sales_overview_df = sales_overview_df.rename(columns={
         "delivery_plan_id": "交付批次ID",
         "customer_name": "客户",
         "po_no": "PO",
@@ -11496,7 +11479,10 @@ def page_sales_dashboard(conn):
         "material_norm": "材质",
         "planned_delivery_date": "计划交付日期",
         "trace_key": "Trace Key",
-    }), hide_index=True)
+    })
+
+    sales_overview_df = sales_overview_df.loc[:, ~sales_overview_df.columns.duplicated()]
+    show_df(sales_overview_df, hide_index=True)
 
     st.markdown("---")
 
@@ -11562,7 +11548,7 @@ def page_sales_dashboard(conn):
     st.markdown("---")
 
     # =========================
-    # 7. WH-SPEC 匹配明细，用于核对库存页和销售页
+    # 7. WH-SPEC 匹配明细
     # =========================
     with st.expander("查看本交付批次匹配到的 WH-SPEC Lot 明细"):
         spec_qty, spec_match_df = _get_available_wh_spec_qty_by_variant(
@@ -11577,7 +11563,10 @@ def page_sales_dashboard(conn):
         if spec_match_df is None or spec_match_df.empty:
             st.info("当前没有匹配到 WH-SPEC Lot。")
         else:
-            show_cols = [
+            tmp_df = spec_match_df.copy()
+            tmp_df["special_process_display"] = tmp_df["special_process_norm"].apply(_display_process)
+
+            spec_detail_cols = [
                 "inventory_lot_id",
                 "lot_code",
                 "trace_key",
@@ -11586,24 +11575,20 @@ def page_sales_dashboard(conn):
                 "lot_status",
                 "release_status",
                 "spec_code_norm",
-                "special_process_norm",
+                "special_process_display",
                 "material_norm",
                 "batch_code",
                 "po_no",
             ]
 
-            existing_cols = [
-                c for c in show_cols
-                if c in spec_match_df.columns
+            spec_detail_cols = [
+                c for c in spec_detail_cols
+                if c in tmp_df.columns
             ]
 
-            tmp_df = spec_match_df.copy()
-            tmp_df["special_process_display"] = tmp_df["special_process_norm"].apply(_display_process)
+            spec_detail_df = tmp_df[spec_detail_cols].copy()
 
-            if "special_process_display" not in existing_cols:
-                existing_cols.append("special_process_display")
-
-            show_df(tmp_df[existing_cols].rename(columns={
+            spec_detail_df = spec_detail_df.rename(columns={
                 "inventory_lot_id": "Lot编号",
                 "lot_code": "Lot号",
                 "trace_key": "Trace Key",
@@ -11612,12 +11597,14 @@ def page_sales_dashboard(conn):
                 "lot_status": "Lot状态",
                 "release_status": "放行状态",
                 "spec_code_norm": "规格",
-                "special_process_norm": "特殊工艺底层值",
-                "special_process_display": "特殊工艺显示",
+                "special_process_display": "特殊工艺",
                 "material_norm": "材质",
                 "batch_code": "来源生产批号",
                 "po_no": "来源PO",
-            }), hide_index=True)
+            })
+
+            spec_detail_df = spec_detail_df.loc[:, ~spec_detail_df.columns.duplicated()]
+            show_df(spec_detail_df, hide_index=True)
 
     # =========================
     # 8. 操作按钮
@@ -11647,7 +11634,17 @@ def page_sales_dashboard(conn):
                     UPDATE delivery_plan
                     SET delivery_status = '发货准备'
                     WHERE delivery_plan_id = ?
-                """, (int(row["delivery_plan_id"]),))
+                """, (
+                    int(row["delivery_plan_id"]),
+                ))
+
+                conn.execute("""
+                    UPDATE order_item
+                    SET item_status = '发货准备'
+                    WHERE order_item_id = ?
+                """, (
+                    int(row["order_item_id"]),
+                ))
 
                 conn.commit()
 
@@ -11680,31 +11677,90 @@ def page_sales_dashboard(conn):
                 "当前有半成品库存，可以考虑进入质检 / 入库流程后再出货。"
             )
 
+        st.markdown("#### 发送至排产看板")
+
+        st.info(
+            "当前成品库存不足。销售确认后，系统会将该交付批次状态更新为【待生产确认】，"
+            "并同步到【生产管理 → 排产看板 → 销售推送待确认】。"
+        )
+
         if st.button(
-            "标记为需要生产 / 补货",
-            key=f"sales_mark_need_production_{int(row['delivery_plan_id'])}"
+            "确认需要生产，发送至排产看板",
+            key=f"sales_send_to_schedule_{int(row['delivery_plan_id'])}"
         ):
             try:
+                conn.execute("PRAGMA busy_timeout = 30000")
+
+                _ensure_sales_need_production_column()
+
+                # 1. 更新交付批次状态：必须和排产看板查询条件一致
                 conn.execute("""
                     UPDATE delivery_plan
-                    SET delivery_status = '需要生产'
+                    SET delivery_status = '待生产确认'
                     WHERE delivery_plan_id = ?
-                """, (int(row["delivery_plan_id"]),))
+                """, (
+                    int(row["delivery_plan_id"]),
+                ))
+
+                # 2. 如果存在 sales_need_production 字段，则写入 1
+                try:
+                    conn.execute("""
+                        UPDATE delivery_plan
+                        SET sales_need_production = 1
+                        WHERE delivery_plan_id = ?
+                    """, (
+                        int(row["delivery_plan_id"]),
+                    ))
+                except Exception:
+                    pass
+
+                # 3. 同步订单明细状态
+                conn.execute("""
+                    UPDATE order_item
+                    SET item_status = '待生产确认'
+                    WHERE order_item_id = ?
+                """, (
+                    int(row["order_item_id"]),
+                ))
+
+                # 4. 同步订单状态
+                conn.execute("""
+                    UPDATE orders
+                    SET order_status = 'production_required'
+                    WHERE order_id = ?
+                """, (
+                    int(row["order_id"]),
+                ))
 
                 conn.commit()
+
+                # 5. 调用全局同步函数
+                if "sync_after_delivery_plan_change" in globals():
+                    try:
+                        sync_after_delivery_plan_change(
+                            conn,
+                            int(row["delivery_plan_id"])
+                        )
+                    except Exception:
+                        pass
+
                 st.cache_data.clear()
-                st.success("已标记为需要生产 / 补货。")
+
+                st.success(
+                    "已确认需要生产，并发送至排产看板。"
+                    "请进入【生产管理 → 排产看板 → 销售推送待确认】查看该交付批次。"
+                )
                 st.rerun()
 
             except Exception as e:
                 conn.rollback()
-                st.error(f"更新失败：{e}")
+                st.error(f"发送至排产看板失败：{e}")
 
     # =========================
     # 9. 调试区
     # =========================
     with st.expander("调试：查看销售看板当前数据"):
-         debug_cols = [
+        debug_cols = [
             "delivery_plan_id",
             "order_item_id",
             "customer_name",
@@ -11733,9 +11789,14 @@ def page_sales_dashboard(conn):
             "trace_key",
         ]
 
-         debug_cols = [c for c in debug_cols if c in dashboard_df.columns]
-         debug_df = dashboard_df[debug_cols].copy()
-         debug_df = debug_df.rename(columns={
+        debug_cols = [
+            c for c in debug_cols
+            if c in dashboard_df.columns
+        ]
+
+        debug_df = dashboard_df[debug_cols].copy()
+
+        debug_df = debug_df.rename(columns={
             "delivery_plan_id": "交付计划ID",
             "order_item_id": "订单明细ID",
             "customer_name": "客户",
@@ -11763,11 +11824,10 @@ def page_sales_dashboard(conn):
             "planned_delivery_date": "计划交付日期",
             "trace_key": "Trace Key",
         })
- 
-        # 双保险：如果仍有重复列名，自动去重
-         debug_df = debug_df.loc[:, ~debug_df.columns.duplicated()]
-         show_df(debug_df, hide_index=True)
 
+        debug_df = debug_df.loc[:, ~debug_df.columns.duplicated()]
+
+        show_df(debug_df, hide_index=True)
 
 # =========================
 # 覆盖版：生产完成 → 自动质检 → 放行后自动入库
