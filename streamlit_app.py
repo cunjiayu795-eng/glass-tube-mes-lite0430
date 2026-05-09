@@ -16214,71 +16214,51 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
     """
     正式入库确认：将质检完成并 released 的生产批次入库。
 
-    兼容两种情况：
-    1. 正常订单链路批次：
-       production_batch -> production_schedule -> delivery_plan -> order_item
-       入库优先进入 WH-ORDER。
+    核心规则：
+    1. 有订单链路的批次：
+       - 先补订单库存 WH-ORDER
+       - WH-ORDER 最多补到该交付批次还需要的数量
+       - 超出订单需求的部分自动进入规格化库存 WH-SPEC
 
-    2. 孤立生产批次：
-       没有 production_schedule / delivery_plan / order_item
-       入库进入 WH-SPEC。
+    2. 没有订单链路的孤立批次：
+       - 全部进入 WH-SPEC
 
-    入库数量：
-    优先使用 qc_pass_qty；
-    如果 qc_pass_qty 为空，则使用 semi_finished_wh_qty。
+    3. 入库数量：
+       - 优先使用 qc_pass_qty
+       - 如果 qc_pass_qty 为空，则使用 semi_finished_wh_qty
 
-    校验条件：
-    release_status 必须为 released / 放行 / 已放行。
-    qc_status 必须为 质检完成 / 端检完成。
+    4. 校验：
+       - release_status 必须为 released / 放行 / 已放行
+       - qc_status 必须为 质检完成 / 端检完成
     """
 
     conn.execute("PRAGMA busy_timeout = 30000")
     cur = conn.cursor()
 
     # =========================
-    # 补齐 inventory_lot 入库追溯字段
+    # 0. 小工具函数
     # =========================
-    try:
-        lot_cols = pd.read_sql_query(
-            "PRAGMA table_info(inventory_lot)",
-            conn
-        )["name"].tolist()
-
-        lot_add_cols = {
-            "source_batch_no": "TEXT DEFAULT ''",
-            "source_po_no": "TEXT DEFAULT ''",
-            "source_customer": "TEXT DEFAULT ''",
-            "last_in_qty": "REAL DEFAULT 0",
-            "last_in_time": "TEXT DEFAULT ''",
-            "created_at": "TEXT DEFAULT ''",
-        }
-
-        for col_name, col_def in lot_add_cols.items():
-            if col_name not in lot_cols:
-                conn.execute(f"""
-                    ALTER TABLE inventory_lot
-                    ADD COLUMN {col_name} {col_def}
-                """)
-
-        conn.commit()
-
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
     def _safe_text(v, default=""):
         value = "" if v is None else str(v).strip()
         return value if value else default
 
     def _safe_float(v, default=0.0):
         try:
+            if v is None:
+                return default
             if pd.isna(v):
                 return default
             return float(v)
         except Exception:
             return default
+
+    def _safe_int_or_none(v):
+        try:
+            if v is None or pd.isna(v):
+                return None
+            return int(v)
+        except Exception:
+            return None
 
     def _normalize_process(v):
         if "normalize_special_process_value" in globals():
@@ -16306,6 +16286,12 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
         return value
 
     def _normalize_material(v):
+        if "canonical_material_value" in globals():
+            try:
+                return canonical_material_value(v)
+            except Exception:
+                pass
+
         if "normalize_material_value" in globals():
             try:
                 return normalize_material_value(v)
@@ -16330,6 +16316,155 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
 
         return material_map.get(value, value if value else "UNKNOWN_MATERIAL")
 
+    def _table_columns(table_name):
+        try:
+            return pd.read_sql_query(
+                f"PRAGMA table_info({table_name})",
+                conn
+            )["name"].tolist()
+        except Exception:
+            return []
+
+    def _add_missing_columns(table_name, add_cols):
+        """
+        安全补字段。
+        add_cols 格式：
+        {
+            "字段名": "字段类型 DEFAULT 默认值"
+        }
+        """
+        existing_cols = _table_columns(table_name)
+
+        for col_name, col_def in add_cols.items():
+            if col_name not in existing_cols:
+                conn.execute(f"""
+                    ALTER TABLE {table_name}
+                    ADD COLUMN {col_name} {col_def}
+                """)
+
+        conn.commit()
+
+    def _dynamic_insert(table_name, data_dict):
+        """
+        根据当前表真实存在的字段动态 INSERT，避免旧数据库缺字段时报错。
+        """
+        cols = _table_columns(table_name)
+
+        insert_data = {
+            k: v
+            for k, v in data_dict.items()
+            if k in cols
+        }
+
+        if not insert_data:
+            raise ValueError(f"{table_name} 没有可写入字段。")
+
+        col_names = list(insert_data.keys())
+        placeholders = ", ".join(["?"] * len(col_names))
+        col_sql = ", ".join(col_names)
+        values = [insert_data[c] for c in col_names]
+
+        cur.execute(
+            f"""
+            INSERT INTO {table_name} ({col_sql})
+            VALUES ({placeholders})
+            """,
+            values
+        )
+
+        return cur.lastrowid
+
+    def _write_inventory_transaction(
+        transaction_type,
+        inventory_lot_id,
+        trace_key,
+        location,
+        qty,
+        reason
+    ):
+        """
+        写库存流水。若 inventory_transaction 字段不完整，则自动按现有字段写入。
+        """
+        try:
+            tx_cols = _table_columns("inventory_transaction")
+
+            if not tx_cols:
+                return
+
+            data = {
+                "transaction_type": transaction_type,
+                "inventory_lot_id": inventory_lot_id,
+                "production_batch_id": int(production_batch_id),
+                "trace_key": trace_key,
+                "location": location,
+                "qty": float(qty),
+                "quantity": float(qty),
+                "operator": confirmed_by,
+                "created_by": confirmed_by,
+                "reason": reason,
+                "remark": reason,
+                "notes": reason,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "transaction_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            insert_data = {
+                k: v
+                for k, v in data.items()
+                if k in tx_cols
+            }
+
+            if insert_data:
+                col_names = list(insert_data.keys())
+                placeholders = ", ".join(["?"] * len(col_names))
+                col_sql = ", ".join(col_names)
+                values = [insert_data[c] for c in col_names]
+
+                cur.execute(
+                    f"""
+                    INSERT INTO inventory_transaction ({col_sql})
+                    VALUES ({placeholders})
+                    """,
+                    values
+                )
+
+        except Exception:
+            # 库存流水失败不阻断主入库，但主库存仍会写入
+            pass
+
+    # =========================
+    # 1. 自动补齐必要字段
+    # =========================
+    try:
+        _add_missing_columns("inventory_lot", {
+            "source_batch_no": "TEXT DEFAULT ''",
+            "source_po_no": "TEXT DEFAULT ''",
+            "source_customer": "TEXT DEFAULT ''",
+            "last_in_qty": "REAL DEFAULT 0",
+            "last_in_time": "TEXT DEFAULT ''",
+            "last_out_qty": "REAL DEFAULT 0",
+            "last_out_time": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        })
+
+        _add_missing_columns("production_batch", {
+            "semi_finished_wh_qty": "REAL DEFAULT 0",
+            "qc_pass_qty": "REAL DEFAULT 0",
+            "qc_loss_qty": "REAL DEFAULT 0",
+            "qc_status": "TEXT DEFAULT ''",
+            "release_status": "TEXT DEFAULT 'pending'",
+            "production_flow_status": "TEXT DEFAULT ''",
+        })
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    # =========================
+    # 2. 读取生产批次与订单链路
+    # =========================
     try:
         batch_df = pd.read_sql_query("""
             SELECT
@@ -16360,6 +16495,7 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
                 oi.trace_key AS order_trace_key,
                 oi.product_spec_text,
                 COALESCE(oi.item_status, '') AS item_status,
+                COALESCE(oi.shipped_qty, 0) AS order_item_shipped_qty,
 
                 p.product_code,
                 p.product_name,
@@ -16408,6 +16544,7 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
             "release",
             "放行",
             "已放行",
+            "released".upper(),
         ]
 
         qc_done = qc_status in [
@@ -16417,6 +16554,7 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
             "QC_DONE",
             "done",
             "DONE",
+            "已入库",
         ]
 
         if not is_released:
@@ -16425,10 +16563,7 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
         if not qc_done:
             return False, "该批次质检尚未完成，不能正式入库。"
 
-        inbound_qty = _safe_float(
-            row.get("qc_pass_qty"),
-            _safe_float(row.get("semi_finished_wh_qty"), 0)
-        )
+        inbound_qty = _safe_float(row.get("qc_pass_qty"), 0)
 
         if inbound_qty <= 0:
             inbound_qty = _safe_float(row.get("semi_finished_wh_qty"), 0)
@@ -16438,14 +16573,17 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
 
         production_batch_id = int(row["production_batch_id"])
         batch_code = _safe_text(row.get("batch_code"))
+
         delivery_plan_id = row.get("delivery_plan_id")
         order_item_id = row.get("order_item_id")
         order_id = row.get("order_id")
 
-        product_id = row.get("product_id")
-        spec_id = row.get("spec_id")
+        product_id = _safe_int_or_none(row.get("product_id"))
+        spec_id = _safe_int_or_none(row.get("spec_id"))
 
         po_no = _safe_text(row.get("po_no"))
+        customer_name = _safe_text(row.get("customer_name"))
+
         spec_code = _safe_text(row.get("spec_code"))
         special_process = _normalize_process(row.get("special_process"))
         material = _normalize_material(row.get("material"))
@@ -16453,116 +16591,156 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
         batch_trace_key = _safe_text(row.get("batch_trace_key"))
         order_trace_key = _safe_text(row.get("order_trace_key"))
 
-        # 有订单链路：优先回订单库存 WH-ORDER
+        planned_delivery_qty = _safe_float(row.get("planned_delivery_qty"), 0)
+        actual_delivery_qty = _safe_float(row.get("actual_delivery_qty"), 0)
+
+        # =========================
+        # 3. 判断是否有订单链路
+        # =========================
         has_order_link = (
             order_item_id is not None
             and not pd.isna(order_item_id)
             and order_trace_key != ""
         )
 
+        # =========================
+        # 4. 计算当前订单库存，避免 WH-ORDER 超过订单需求
+        # =========================
+        current_wh_order_qty = 0.0
+
         if has_order_link:
-            target_location = "WH-ORDER"
-            target_trace_key = order_trace_key
-            inbound_to_order_qty = inbound_qty
-            inbound_to_spec_qty = 0.0
-        else:
-            # 孤立批次：进入规格化库存 WH-SPEC
-            target_location = "WH-SPEC"
+            wh_order_df = pd.read_sql_query("""
+                SELECT
+                    COALESCE(SUM(
+                        COALESCE(available_qty, 0)
+                        + COALESCE(reserved_qty, 0)
+                    ), 0) AS wh_order_qty
+                FROM inventory_lot
+                WHERE location = 'WH-ORDER'
+                  AND trace_key = ?
+                  AND COALESCE(lot_status, 'available') IN ('available', 'partial')
+                  AND COALESCE(release_status, 'released') IN ('released', '放行', 'RELEASED')
+            """, conn, params=[order_trace_key])
 
-            if spec_code:
-                target_trace_key = (
-                    f"SPEC_STOCK__{spec_code}__{special_process}__{material}"
+            if not wh_order_df.empty:
+                current_wh_order_qty = _safe_float(
+                    wh_order_df.iloc[0].get("wh_order_qty"),
+                    0
                 )
-            else:
-                target_trace_key = (
-                    batch_trace_key
-                    or f"SPEC_STOCK__UNKNOWN_SPEC__{special_process}__{material}"
-                )
 
-            inbound_to_order_qty = 0.0
-            inbound_to_spec_qty = inbound_qty
-
-        # 如果没有 product_id / spec_id，尝试从 trace_key 或现有字段兜底，不强制失败
-        if product_id is not None and pd.isna(product_id):
-            product_id = None
-
-        if spec_id is not None and pd.isna(spec_id):
-            spec_id = None
-
-        lot_code = f"LOT-{batch_code}-INBOUND"
-
-        # 1. 写入 inventory_lot
-        cur.execute("""
-            INSERT INTO inventory_lot (
-                lot_code,
-                product_id,
-                spec_id,
-                production_batch_id,
-                trace_key,
-                location,
-                available_qty,
-                reserved_qty,
-                lot_status,
-                release_status,
-                source_batch_no,
-                source_po_no,
-                source_customer,
-                last_in_qty,
-                last_in_time,
-                created_at
+        # =========================
+        # 5. 入库拆分逻辑
+        # =========================
+        # 正常订单批次：
+        #   订单还需要数量 = 计划交付数量 - 已出货数量 - 当前 WH-ORDER 库存
+        #   本次最多补这个缺口
+        #
+        # 孤立批次：
+        #   全部进入 WH-SPEC
+        # =========================
+        if has_order_link:
+            remaining_order_need_qty = max(
+                planned_delivery_qty
+                - actual_delivery_qty
+                - current_wh_order_qty,
+                0
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'available', 'released', ?, ?, ?, ?, datetime('now'), datetime('now'))
-        """, (
-            lot_code,
-            None if product_id is None else int(product_id),
-            None if spec_id is None else int(spec_id),
-            int(production_batch_id),
-            target_trace_key,
-            target_location,
-            float(inbound_qty),
-            batch_code,
-            po_no,
-            _safe_text(row.get("customer_name")),
-            float(inbound_qty),
-        ))
 
-        # 2. 写入库存流水
-        try:
-            cur.execute("""
-                INSERT INTO inventory_transaction (
-                    transaction_type,
-                    inventory_lot_id,
-                    production_batch_id,
-                    trace_key,
-                    location,
-                    qty,
-                    operator,
-                    reason,
-                    created_at
-                )
-                VALUES (
-                    'INBOUND',
-                    last_insert_rowid(),
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    datetime('now')
-                )
-            """, (
-                int(production_batch_id),
-                target_trace_key,
-                target_location,
+            inbound_to_order_qty = min(
                 float(inbound_qty),
-                confirmed_by,
-                "质检完成后正式入库"
-            ))
-        except Exception:
-            pass
+                float(remaining_order_need_qty)
+            )
 
-        # 3. 清零半成品数量，更新生产批次状态
+            inbound_to_spec_qty = max(
+                float(inbound_qty) - float(inbound_to_order_qty),
+                0
+            )
+
+        else:
+            remaining_order_need_qty = 0.0
+            inbound_to_order_qty = 0.0
+            inbound_to_spec_qty = float(inbound_qty)
+
+        # =========================
+        # 6. 构造 Trace Key
+        # =========================
+        if spec_code:
+            spec_stock_trace_key = (
+                f"SPEC_STOCK__{spec_code}__{special_process}__{material}"
+            )
+        else:
+            spec_stock_trace_key = (
+                batch_trace_key
+                or f"SPEC_STOCK__UNKNOWN_SPEC__{special_process}__{material}"
+            )
+
+        # =========================
+        # 7. 写入库存 Lot
+        # =========================
+        inserted_lot_ids = []
+
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _insert_inventory_lot(location, trace_key, qty, suffix):
+            lot_code = f"LOT-{batch_code}-{suffix}"
+
+            lot_data = {
+                "lot_code": lot_code,
+                "product_id": product_id,
+                "spec_id": spec_id,
+                "production_batch_id": int(production_batch_id),
+                "trace_key": trace_key,
+                "location": location,
+                "available_qty": float(qty),
+                "reserved_qty": 0.0,
+                "total_qty": float(qty),
+                "lot_status": "available" if float(qty) > 0 else "depleted",
+                "release_status": "released",
+                "source_batch_no": batch_code,
+                "source_po_no": po_no,
+                "source_customer": customer_name,
+                "last_in_qty": float(qty),
+                "last_in_time": now_text,
+                "created_at": now_text,
+            }
+
+            lot_id = _dynamic_insert("inventory_lot", lot_data)
+
+            _write_inventory_transaction(
+                transaction_type="INBOUND",
+                inventory_lot_id=lot_id,
+                trace_key=trace_key,
+                location=location,
+                qty=float(qty),
+                reason=f"质检完成后正式入库：{batch_code}"
+            )
+
+            inserted_lot_ids.append(lot_id)
+
+            return lot_id
+
+        if inbound_to_order_qty > 0:
+            _insert_inventory_lot(
+                location="WH-ORDER",
+                trace_key=order_trace_key,
+                qty=inbound_to_order_qty,
+                suffix="WHORDER"
+            )
+
+        if inbound_to_spec_qty > 0:
+            _insert_inventory_lot(
+                location="WH-SPEC",
+                trace_key=spec_stock_trace_key,
+                qty=inbound_to_spec_qty,
+                suffix="WHSPEC"
+            )
+
+        if inbound_to_order_qty <= 0 and inbound_to_spec_qty <= 0:
+            return False, "本次没有可入库数量。"
+
+        # =========================
+        # 8. 更新生产批次状态
+        # =========================
         cur.execute("""
             UPDATE production_batch
             SET semi_finished_wh_qty = 0,
@@ -16576,7 +16754,9 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
             int(production_batch_id)
         ))
 
-        # 4. 同步 delivery_plan
+        # =========================
+        # 9. 同步 delivery_plan / order_item / orders
+        # =========================
         if delivery_plan_id is not None and not pd.isna(delivery_plan_id):
             cur.execute("""
                 UPDATE delivery_plan
@@ -16586,7 +16766,6 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
                 int(delivery_plan_id),
             ))
 
-        # 5. 同步 order_item
         if order_item_id is not None and not pd.isna(order_item_id):
             cur.execute("""
                 UPDATE order_item
@@ -16596,7 +16775,6 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
                 int(order_item_id),
             ))
 
-        # 6. 同步 orders
         if order_id is not None and not pd.isna(order_id):
             cur.execute("""
                 UPDATE orders
@@ -16615,15 +16793,31 @@ def confirm_batch_inbound_to_inventory(conn, production_batch_id, confirmed_by="
             except Exception:
                 pass
 
-        return (
-            True,
-            f"入库成功：{batch_code} 已入库 {inbound_qty:.0f}，"
-            f"进入 {target_location}。"
-        )
+        msg_parts = [
+            f"入库成功：{batch_code} 共入库 {inbound_qty:.0f}。"
+        ]
+
+        if has_order_link:
+            msg_parts.append(
+                f"订单需求缺口 {remaining_order_need_qty:.0f}，"
+                f"本次进入 WH-ORDER {inbound_to_order_qty:.0f}，"
+                f"进入 WH-SPEC {inbound_to_spec_qty:.0f}。"
+            )
+        else:
+            msg_parts.append(
+                f"该批次无订单链路，本次全部进入 WH-SPEC {inbound_to_spec_qty:.0f}。"
+            )
+
+        return True, "".join(msg_parts)
 
     except Exception as e:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return False, f"入库确认失败：{e}"
+
+
 
 def page_production_dashboard(conn):
     st.header("生产｜排产看板")
