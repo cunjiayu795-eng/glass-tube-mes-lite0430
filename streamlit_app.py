@@ -1065,11 +1065,77 @@ def column_label(name: str) -> str:
     return COLUMN_LABELS.get(name, name)
 
 
+def _make_unique_columns(columns):
+    """
+    让列名唯一，避免 Streamlit / PyArrow 因重复列名报错。
+
+    例如：
+    操作员, 操作员 -> 操作员, 操作员_2
+    备注, 备注, 备注 -> 备注, 备注_2, 备注_3
+    """
+    seen = {}
+    result = []
+
+    for col in columns:
+        col = str(col)
+
+        if col not in seen:
+            seen[col] = 1
+            result.append(col)
+        else:
+            seen[col] += 1
+            result.append(f"{col}_{seen[col]}")
+
+    return result
+
+
 def beautify_df_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+    """
+    通用 DataFrame 展示美化：
+    1. 复制原表，避免修改原始数据
+    2. 先去除原始重复列
+    3. 再做中文列名映射
+    4. 映射后再次保证列名唯一
+
+    这样可以解决：
+    operator / operator_name 同时映射为“操作员”
+    completed_at / end_time 同时映射为“结束时间”
+    notes / remark 同时映射为“备注”
+    导致 Streamlit 报 Duplicate column names 的问题。
+    """
+    if df is None:
         return df
-    rename_map = {col: column_label(col) for col in df.columns}
-    return df.rename(columns=rename_map)
+
+    if df.empty:
+        return df
+
+    safe_df = df.copy()
+
+    # 第一步：去除原始重复列名
+    safe_df = safe_df.loc[:, ~safe_df.columns.duplicated()].copy()
+
+    # 第二步：中文映射
+    rename_map = {
+        col: column_label(col)
+        for col in safe_df.columns
+    }
+
+    safe_df = safe_df.rename(columns=rename_map)
+
+    # 第三步：中文映射后再次保证列名唯一
+    safe_df.columns = _make_unique_columns(safe_df.columns)
+
+    return safe_df
+
+
+def show_df(df: pd.DataFrame, **kwargs):
+    """
+    系统统一表格展示函数。
+    所有 dataframe 都先经过列名安全处理，避免重复列名导致页面崩溃。
+    """
+    safe_df = beautify_df_for_display(df)
+    st.dataframe(safe_df, use_container_width=True, **kwargs)
+
 
 def format_delivery_detail_multiline(detail_text):
     if pd.isna(detail_text) or str(detail_text).strip() == "":
@@ -1526,9 +1592,6 @@ def render_current_order_trace_detail(conn, order_item_id):
 def beautify_sheet_name(name: str) -> str:
     return table_label(name)[:31]
 
-
-def show_df(df: pd.DataFrame, **kwargs):
-    st.dataframe(beautify_df_for_display(df), use_container_width=True, **kwargs)
 
 
 def beautify_dynamic_module_df(df: pd.DataFrame, fields_df: pd.DataFrame) -> pd.DataFrame:
@@ -8163,9 +8226,6 @@ def page_quality_release(conn):
         st.rerun()
 
 
-
-
-
 def page_realtime_query(conn):
     st.header("实时刷新查询")
 
@@ -8298,7 +8358,8 @@ def page_realtime_query(conn):
                 st.subheader("批次主信息")
                 show_df(batch_info)
                 st.subheader("工序日志")
-                show_df(process_info)
+                process_info = process_info.loc[:, ~process_info.columns.duplicated()]
+                show_df(process_info, hide_index=True)
                 st.subheader("检测记录")
                 show_df(qc_info)
                 st.subheader("库存")
